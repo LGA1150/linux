@@ -82,7 +82,7 @@ int pppox_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
 			break;
 
 		rc = -EINVAL;
-		index = ppp_channel_index(&po->chan);
+		index = ppp_channel_index(po->chan);
 		if (put_user(index , (int __user *) arg))
 			break;
 
@@ -101,7 +101,7 @@ int pppox_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
 		 */
 		while ((skb = skb_dequeue(&sk->sk_receive_queue))) {
 			skb_orphan(skb);
-			ppp_input(&po->chan, skb);
+			ppp_input(po->chan, skb);
 		}
 		break;
 	}

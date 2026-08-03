@@ -65,7 +65,7 @@ struct syncppp {
 
 	struct tasklet_struct tsk;
 
-	struct ppp_channel chan;	/* interface to generic ppp layer */
+	struct ppp_channel *chan;	/* interface to generic ppp layer */
 };
 
 /* Bit numbers in xmit_flags */
@@ -117,9 +117,9 @@ ppp_print_buffer (const char *name, const __u8 *buf, int count)
 static int
 ppp_sync_open(struct tty_struct *tty)
 {
+	struct ppp_channel_conf conf = {};
 	struct syncppp *ap;
 	int err;
-	int speed;
 
 	if (tty->ops->write == NULL)
 		return -EOPNOTSUPP;
@@ -141,13 +141,14 @@ ppp_sync_open(struct tty_struct *tty)
 	skb_queue_head_init(&ap->rqueue);
 	tasklet_setup(&ap->tsk, ppp_sync_process);
 
-	ap->chan.private = ap;
-	ap->chan.ops = &sync_ops;
-	ap->chan.mtu = PPP_MRU;
-	ap->chan.hdrlen = 2;	/* for A/C bytes */
-	speed = tty_get_baud_rate(tty);
-	ap->chan.speed = speed;
-	err = ppp_register_channel(&ap->chan);
+	conf.private = ap;
+	conf.ops = &sync_ops;
+	conf.hdrlen = 2;	/* for A/C bytes */
+#ifdef CONFIG_PPP_MULTILINK
+	conf.mtu = PPP_MRU;
+	conf.speed = tty_get_baud_rate(tty);
+#endif
+	err = ppp_register_channel(&conf, &ap->chan);
 	if (err)
 		goto out_free;
 
@@ -217,14 +218,14 @@ ppp_synctty_ioctl(struct tty_struct *tty, unsigned int cmd, unsigned long arg)
 	switch (cmd) {
 	case PPPIOCGCHAN:
 		err = -EFAULT;
-		if (put_user(ppp_channel_index(&ap->chan), p))
+		if (put_user(ppp_channel_index(ap->chan), p))
 			break;
 		err = 0;
 		break;
 
 	case PPPIOCGUNIT:
 		err = -EFAULT;
-		if (put_user(ppp_unit_number(&ap->chan), p))
+		if (put_user(ppp_unit_number(ap->chan), p))
 			break;
 		err = 0;
 		break;
@@ -411,16 +412,16 @@ static void ppp_sync_process(struct tasklet_struct *t)
 	while ((skb = skb_dequeue(&ap->rqueue)) != NULL) {
 		if (skb->len == 0) {
 			/* zero length buffers indicate error */
-			ppp_input_error(&ap->chan);
+			ppp_input_error(ap->chan);
 			kfree_skb(skb);
 		}
 		else
-			ppp_input(&ap->chan, skb);
+			ppp_input(ap->chan, skb);
 	}
 
 	/* try to push more stuff out */
 	if (test_bit(XMIT_WAKEUP, &ap->xmit_flags) && ppp_sync_push(ap))
-		ppp_output_wakeup(&ap->chan);
+		ppp_output_wakeup(ap->chan);
 }
 
 /*
@@ -577,7 +578,7 @@ ppp_sync_flush_output(struct syncppp *ap)
 	}
 	spin_unlock_bh(&ap->xmit_lock);
 	if (done)
-		ppp_output_wakeup(&ap->chan);
+		ppp_output_wakeup(ap->chan);
 }
 
 /*
