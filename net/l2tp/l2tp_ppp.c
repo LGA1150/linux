@@ -222,7 +222,7 @@ static void pppol2tp_recv(struct l2tp_session *session, struct sk_buff *skb, int
 		struct pppox_sock *po;
 
 		po = pppox_sk(sk);
-		ppp_input(&po->chan, skb);
+		ppp_input(po->chan, skb);
 	} else {
 		if (sock_queue_rcv_skb(sk, skb) < 0) {
 			atomic_long_inc(&session->stats.rx_errors);
@@ -505,7 +505,7 @@ static void pppol2tp_show(struct seq_file *m, void *arg)
 	if (sk) {
 		struct pppox_sock *po = pppox_sk(sk);
 
-		seq_printf(m, "   interface %s\n", ppp_dev_name(&po->chan));
+		seq_printf(m, "   interface %s\n", ppp_dev_name(po->chan));
 	}
 	rcu_read_unlock();
 }
@@ -613,7 +613,7 @@ static int pppol2tp_sockaddr_get_info(const void *sa, int sa_len,
  * numbers and no IP option. Not quite accurate, but the result is mostly
  * unused anyway.
  */
-static int pppol2tp_tunnel_mtu(const struct l2tp_tunnel *tunnel)
+static int __maybe_unused pppol2tp_tunnel_mtu(const struct l2tp_tunnel *tunnel)
 {
 	int mtu;
 
@@ -695,6 +695,7 @@ static int pppol2tp_connect(struct socket *sock, struct sockaddr_unsized *userva
 	struct l2tp_tunnel *tunnel;
 	struct pppol2tp_session *ps;
 	struct l2tp_session_cfg cfg = { 0, };
+	struct ppp_channel_conf conf = {};
 	bool drop_refcnt = false;
 	bool new_session = false;
 	bool new_tunnel = false;
@@ -793,14 +794,16 @@ static int pppol2tp_connect(struct socket *sock, struct sockaddr_unsized *userva
 	 * the net device's hard_header_len at registration, which must be
 	 * sufficient regardless of whether sequence numbers are enabled later.
 	 */
-	po->chan.hdrlen = PPPOL2TP_L2TP_HDR_SIZE_SEQ;
+	conf.hdrlen = PPPOL2TP_L2TP_HDR_SIZE_SEQ;
 
-	po->chan.private = sk;
-	po->chan.ops	 = &pppol2tp_chan_ops;
-	po->chan.mtu	 = pppol2tp_tunnel_mtu(tunnel);
-	po->chan.direct_xmit	= true;
+	conf.private = sk;
+	conf.ops	 = &pppol2tp_chan_ops;
+#ifdef CONFIG_PPP_MULTILINK
+	conf.mtu	 = pppol2tp_tunnel_mtu(tunnel);
+#endif
+	conf.direct_xmit	= true;
 
-	error = ppp_register_net_channel(sock_net(sk), &po->chan);
+	error = ppp_register_net_channel(sock_net(sk), &conf, &po->chan);
 	if (error) {
 		mutex_unlock(&ps->sk_lock);
 		goto end;
@@ -1562,7 +1565,7 @@ static void pppol2tp_seq_session_show(struct seq_file *m, void *v)
 	if (sk) {
 		struct pppox_sock *po = pppox_sk(sk);
 
-		seq_printf(m, "   interface %s\n", ppp_dev_name(&po->chan));
+		seq_printf(m, "   interface %s\n", ppp_dev_name(po->chan));
 	}
 	rcu_read_unlock();
 }
