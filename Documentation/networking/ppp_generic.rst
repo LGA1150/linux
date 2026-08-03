@@ -47,7 +47,7 @@ functions used to communicate between the generic PPP layer and PPP
 channels.
 
 Each channel has to provide two functions to the generic PPP layer,
-via the ppp_channel.ops pointer:
+via the ppp_channel_conf.ops pointer:
 
 * start_xmit() is called by the generic layer when it has a frame to
   send.  The channel has the option of rejecting the frame for
@@ -63,7 +63,7 @@ via the ppp_channel.ops pointer:
   system call on an instance of /dev/ppp which is bound to the
   channel.  (Usually it would only be pppd which would do this.)
 
-The generic PPP layer provides seven functions to channels:
+The generic PPP layer provides the following functions to channels:
 
 * ppp_register_channel() is called when a channel has been created, to
   notify the PPP generic layer of its presence.  For example, setting
@@ -93,6 +93,10 @@ The generic PPP layer provides seven functions to channels:
 * ppp_unit_number() returns the unit number of the ppp network
   interface to which this channel is connected, or -1 if the channel
   is not connected.
+
+* ppp_channel_update_mtu() updates the maximum transmit unit used for
+  multilink fragmentation after the channel has been registered.  It is
+  a no-op when multilink support is disabled.
 
 Connecting a channel to the ppp generic layer is initiated from the
 channel code, rather than from the generic layer.  The channel is
@@ -124,18 +128,20 @@ presented to the start_xmit() function contain only the 2-byte
 protocol number and the data, and the skbuffs presented to ppp_input()
 must be in the same format.
 
-The channel must provide an instance of a ppp_channel struct to
-represent the channel.  The channel is free to use the ``private`` field
-however it wishes.  The channel should initialize the ``mtu`` and
-``hdrlen`` fields before calling ppp_register_channel() and not change
-them until after ppp_unregister_channel() returns.  The ``mtu`` field
-represents the maximum size of the data part of the PPP frames, that
-is, it does not include the 2-byte protocol number.
+The channel must provide an instance of a ppp_channel_conf struct to
+describe the channel during registration.  The generic layer will
+allocate a ppp_channel struct and store a pointer to it in the output
+argument.  Registration returns 0 on success or a negative error code.
+The ppp_channel struct is opaque to the channel driver.  The ``mtu``
+field (if multilink is enabled) represents the maximum size of the data
+part of the PPP frames, that is, it does not include the 2-byte protocol
+number.  ppp_channel_update_mtu() can be called by the channel driver to
+update the ``mtu`` field once LCP MRU negotiation is complete.
 
 If the channel needs some headroom in the skbuffs presented to it for
 transmission (i.e., some space free in the skbuff data area before the
 start of the PPP frame), it should set the ``hdrlen`` field of the
-ppp_channel struct to the amount of headroom required.  The generic
+ppp_channel_conf struct to the amount of headroom required.  The generic
 PPP layer will attempt to provide that much headroom but the channel
 should still check if there is sufficient headroom and copy the skbuff
 if there isn't.
@@ -199,19 +205,11 @@ The PPP generic layer has been designed to be SMP-safe.  Locks are
 used around accesses to the internal data structures where necessary
 to ensure their integrity.  As part of this, the generic layer
 requires that the channels adhere to certain requirements and in turn
-provides certain guarantees to the channels.  Essentially the channels
-are required to provide the appropriate locking on the ppp_channel
-structures that form the basis of the communication between the
-channel and the generic layer.  This is because the channel provides
-the storage for the ppp_channel structure, and so the channel is
-required to provide the guarantee that this storage exists and is
-valid at the appropriate times.
+provides certain guarantees to the channels.  The generic layer manages
+the ppp_channel object, ensuring it exists and is valid while the
+channel is registered.
 
 The generic layer requires these guarantees from the channel:
-
-* The ppp_channel object must exist from the time that
-  ppp_register_channel() is called until after the call to
-  ppp_unregister_channel() returns.
 
 * No thread may be in a call to any of ppp_input(), ppp_input_error(),
   ppp_output_wakeup(), ppp_channel_index() or ppp_unit_number() for a
@@ -453,4 +451,4 @@ an interface unit are:
   fragments is disabled.  This ioctl is only available if the
   CONFIG_PPP_MULTILINK option is selected.
 
-Last modified: 7-feb-2002
+Last modified: 3-aug-2026
