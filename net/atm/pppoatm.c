@@ -210,7 +210,9 @@ static void pppoatm_push(struct atm_vcc *atmvcc, struct sk_buff *skb)
 		    !memcmp(skb->data, &pppllc[LLC_LEN],
 		    sizeof(pppllc) - LLC_LEN)) {
 			pvcc->encaps = e_vc;
-			pvcc->chan.mtu += LLC_LEN;
+			/* VC multiplexing does not need the reserved LLC header. */
+			ppp_channel_update_mtu(&pvcc->chan,
+					       atmvcc->qos.txtp.max_sdu - PPP_HDRLEN);
 			break;
 		}
 		pr_debug("Couldn't autodetect yet (skb: %6ph)\n", skb->data);

@@ -77,6 +77,13 @@ extern int ppp_unit_number(struct ppp_channel *);
  */
 extern char *ppp_dev_name(struct ppp_channel *);
 
+/* Update the MTU of a multilink channel */
+#ifdef CONFIG_PPP_MULTILINK
+void ppp_channel_update_mtu(struct ppp_channel *chan, int mtu);
+#else
+static inline void ppp_channel_update_mtu(struct ppp_channel *chan, int mtu) {}
+#endif
+
 /*
  * SMP locking notes:
  * The channel code must ensure that when it calls ppp_unregister_channel,

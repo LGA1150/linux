@@ -921,7 +921,7 @@ static void async_lcp_peek(struct asyncppp *ap, unsigned char *data,
 			if (inbound)
 				ap->mru = val;
 			else
-				ap->chan.mtu = val;
+				ppp_channel_update_mtu(&ap->chan, val);
 			break;
 		case LCP_ASYNCMAP:
 			val = get_unaligned_be32(data + 2);

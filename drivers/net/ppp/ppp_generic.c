@@ -2891,6 +2891,13 @@ ppp_mp_reconstruct(struct ppp *ppp)
 
 	return skb;
 }
+
+/* Update the MTU of a multilink channel */
+void ppp_channel_update_mtu(struct ppp_channel *chan, int mtu)
+{
+	chan->mtu = mtu;
+}
+EXPORT_SYMBOL(ppp_channel_update_mtu);
 #endif /* CONFIG_PPP_MULTILINK */
 
 /*
