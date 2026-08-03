@@ -35,14 +35,15 @@ struct ppp_channel_ops {
 				     void *);
 };
 
-struct ppp_channel {
+struct ppp_channel_conf {
 	void		*private;	/* channel private data */
 	const struct ppp_channel_ops *ops; /* operations for this channel */
-	int		mtu;		/* max transmit packet size */
 	int		hdrlen;		/* amount of headroom channel needs */
-	void		*ppp;		/* opaque to channel */
-	int		speed;		/* transfer rate (bytes/second) */
 	bool		direct_xmit;	/* no qdisc, xmit directly */
+#ifdef CONFIG_PPP_MULTILINK
+	int		speed;		/* transfer rate (bytes/second) */
+	int		mtu;		/* max transmit packet size */
+#endif
 };
 
 #ifdef __KERNEL__
@@ -57,14 +58,17 @@ extern void ppp_input(struct ppp_channel *, struct sk_buff *);
    that we may have missed a packet. */
 extern void ppp_input_error(struct ppp_channel *);
 
-/* Attach a channel to a given PPP unit in specified net. */
-extern int ppp_register_net_channel(struct net *, struct ppp_channel *);
+/* Create a new, unattached ppp channel for specified net. */
+extern int ppp_register_net_channel(struct net *,
+				    const struct ppp_channel_conf *,
+				    struct ppp_channel **);
 
-/* Attach a channel to a given PPP unit. */
-extern int ppp_register_channel(struct ppp_channel *);
+/* Create a new, unattached ppp channel. */
+extern int ppp_register_channel(const struct ppp_channel_conf *,
+				struct ppp_channel **);
 
 /* Detach a channel from its PPP unit (e.g. on hangup). */
-extern void ppp_unregister_channel(struct ppp_channel *);
+extern void ppp_unregister_channel(struct ppp_channel **);
 
 /* Get the channel number for a channel */
 extern int ppp_channel_index(struct ppp_channel *);

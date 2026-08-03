@@ -63,7 +63,7 @@ struct asyncppp {
 
 	struct tasklet_struct tsk;
 
-	struct ppp_channel chan;	/* interface to generic ppp layer */
+	struct ppp_channel *chan;	/* interface to generic ppp layer */
 	unsigned char	obuf[OBUFSIZE];
 };
 
@@ -118,9 +118,9 @@ static const struct ppp_channel_ops async_ops = {
 static int
 ppp_asynctty_open(struct tty_struct *tty)
 {
+	struct ppp_channel_conf conf = {};
 	struct asyncppp *ap;
 	int err;
-	int speed;
 
 	if (tty->ops->write == NULL)
 		return -EOPNOTSUPP;
@@ -145,12 +145,13 @@ ppp_asynctty_open(struct tty_struct *tty)
 	skb_queue_head_init(&ap->rqueue);
 	tasklet_setup(&ap->tsk, ppp_async_process);
 
-	ap->chan.private = ap;
-	ap->chan.ops = &async_ops;
-	ap->chan.mtu = PPP_MRU;
-	speed = tty_get_baud_rate(tty);
-	ap->chan.speed = speed;
-	err = ppp_register_channel(&ap->chan);
+	conf.private = ap;
+	conf.ops = &async_ops;
+#ifdef CONFIG_PPP_MULTILINK
+	conf.mtu = PPP_MRU;
+	conf.speed = tty_get_baud_rate(tty);
+#endif
+	err = ppp_register_channel(&conf, &ap->chan);
 	if (err)
 		goto out_free;
 
@@ -226,14 +227,14 @@ ppp_asynctty_ioctl(struct tty_struct *tty, unsigned int cmd, unsigned long arg)
 	switch (cmd) {
 	case PPPIOCGCHAN:
 		err = -EFAULT;
-		if (put_user(ppp_channel_index(&ap->chan), p))
+		if (put_user(ppp_channel_index(ap->chan), p))
 			break;
 		err = 0;
 		break;
 
 	case PPPIOCGUNIT:
 		err = -EFAULT;
-		if (put_user(ppp_unit_number(&ap->chan), p))
+		if (put_user(ppp_unit_number(ap->chan), p))
 			break;
 		err = 0;
 		break;
@@ -420,13 +421,13 @@ static void ppp_async_process(struct tasklet_struct *t)
 	/* process received packets */
 	while ((skb = skb_dequeue(&ap->rqueue)) != NULL) {
 		if (skb->cb[0])
-			ppp_input_error(&ap->chan);
-		ppp_input(&ap->chan, skb);
+			ppp_input_error(ap->chan);
+		ppp_input(ap->chan, skb);
 	}
 
 	/* try to push more stuff out */
 	if (test_bit(XMIT_WAKEUP, &ap->xmit_flags) && ppp_async_push(ap))
-		ppp_output_wakeup(&ap->chan);
+		ppp_output_wakeup(ap->chan);
 }
 
 /*
@@ -662,7 +663,7 @@ ppp_async_flush_output(struct asyncppp *ap)
 	}
 	spin_unlock_bh(&ap->xmit_lock);
 	if (done)
-		ppp_output_wakeup(&ap->chan);
+		ppp_output_wakeup(ap->chan);
 }
 
 /*
@@ -921,7 +922,7 @@ static void async_lcp_peek(struct asyncppp *ap, unsigned char *data,
 			if (inbound)
 				ap->mru = val;
 			else
-				ppp_channel_update_mtu(&ap->chan, val);
+				ppp_channel_update_mtu(ap->chan, val);
 			break;
 		case LCP_ASYNCMAP:
 			val = get_unaligned_be32(data + 2);

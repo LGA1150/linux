@@ -335,7 +335,7 @@ allow_packet:
 
 		skb->ip_summed = CHECKSUM_NONE;
 		skb_set_network_header(skb, skb->head-skb->data);
-		ppp_input(&po->chan, skb);
+		ppp_input(po->chan, skb);
 
 		return NET_RX_SUCCESS;
 	}
@@ -419,6 +419,7 @@ static int pptp_connect(struct socket *sock, struct sockaddr_unsized *uservaddr,
 	struct sockaddr_pppox *sp = (struct sockaddr_pppox *) uservaddr;
 	struct pppox_sock *po = pppox_sk(sk);
 	struct pptp_opt *opt = &po->proto.pptp;
+	struct ppp_channel_conf conf = {};
 	struct rtable *rt;
 	struct flowi4 fl4;
 	int error = 0;
@@ -450,9 +451,6 @@ static int pptp_connect(struct socket *sock, struct sockaddr_unsized *uservaddr,
 		goto end;
 	}
 
-	po->chan.private = sk;
-	po->chan.ops = &pptp_chan_ops;
-
 	rt = pptp_route_output(po, &fl4);
 	if (IS_ERR(rt)) {
 		error = -EHOSTUNREACH;
@@ -460,14 +458,17 @@ static int pptp_connect(struct socket *sock, struct sockaddr_unsized *uservaddr,
 	}
 	sk_setup_caps(sk, &rt->dst);
 
-	po->chan.mtu = dst_mtu(&rt->dst);
-	if (!po->chan.mtu)
-		po->chan.mtu = PPP_MRU;
-	po->chan.mtu -= PPTP_HEADER_OVERHEAD;
-
-	po->chan.hdrlen = 2 + sizeof(struct pptp_gre_header);
-	po->chan.direct_xmit = true;
-	error = ppp_register_channel(&po->chan);
+	conf.private = sk;
+	conf.ops = &pptp_chan_ops;
+	conf.hdrlen = 2 + sizeof(struct pptp_gre_header);
+	conf.direct_xmit = true;
+#ifdef CONFIG_PPP_MULTILINK
+	conf.mtu = dst_mtu(&rt->dst);
+	if (!conf.mtu)
+		conf.mtu = PPP_MRU;
+	conf.mtu -= PPTP_HEADER_OVERHEAD;
+#endif
+	error = ppp_register_channel(&conf, &po->chan);
 	if (error) {
 		pr_err("PPTP: failed to register PPP channel (%d)\n", error);
 		goto end;
