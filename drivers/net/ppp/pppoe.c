@@ -356,7 +356,7 @@ static int pppoe_rcv_core(struct sock *sk, struct sk_buff *skb)
 	 */
 
 	if (sk->sk_state & PPPOX_BOUND) {
-		ppp_input(&po->chan, skb);
+		ppp_input(po->chan, skb);
 	} else {
 		if (sock_queue_rcv_skb(sk, skb))
 			goto abort_kfree;
@@ -630,7 +630,6 @@ static int pppoe_connect(struct socket *sock, struct sockaddr_unsized *uservaddr
 
 		po->pppoe_ifindex = 0;
 		memset(&po->pppoe_pa, 0, sizeof(po->pppoe_pa));
-		memset(&po->chan, 0, sizeof(po->chan));
 		po->next = NULL;
 		po->num = 0;
 
@@ -639,6 +638,8 @@ static int pppoe_connect(struct socket *sock, struct sockaddr_unsized *uservaddr
 
 	/* Re-bind in session stage only */
 	if (stage_session(sp->sa_addr.pppoe.sid)) {
+		struct ppp_channel_conf conf = {};
+
 		error = -ENODEV;
 		net = sock_net(sk);
 		dev = dev_get_by_name(net, sp->sa_addr.pppoe.dev);
@@ -662,15 +663,15 @@ static int pppoe_connect(struct socket *sock, struct sockaddr_unsized *uservaddr
 		if (error < 0)
 			goto err_put;
 
-		po->chan.hdrlen = (sizeof(struct pppoe_hdr) +
-				   dev->hard_header_len);
+		conf.hdrlen = sizeof(struct pppoe_hdr) + dev->hard_header_len;
+#ifdef CONFIG_PPP_MULTILINK
+		conf.mtu = dev->mtu - sizeof(struct pppoe_hdr) - 2;
+#endif
+		conf.private = sk;
+		conf.ops = &pppoe_chan_ops;
+		conf.direct_xmit = true;
 
-		po->chan.mtu = dev->mtu - sizeof(struct pppoe_hdr) - 2;
-		po->chan.private = sk;
-		po->chan.ops = &pppoe_chan_ops;
-		po->chan.direct_xmit = true;
-
-		error = ppp_register_net_channel(dev_net(dev), &po->chan);
+		error = ppp_register_net_channel(dev_net(dev), &conf, &po->chan);
 		if (error) {
 			delete_item(pn, po->pppoe_pa.sid,
 				    po->pppoe_pa.remote, po->pppoe_ifindex);
