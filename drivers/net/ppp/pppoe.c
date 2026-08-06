@@ -343,18 +343,16 @@ static struct notifier_block pppoe_notifier = {
 
 /************************************************************************
  *
- * Do the real work of receiving a PPPoE Session frame.
+ * Backlog receive a PPPoE Session frame.
  *
  ***********************************************************************/
-static int pppoe_rcv_core(struct sock *sk, struct sk_buff *skb)
+static int pppoe_backlog_rcv(struct sock *sk, struct sk_buff *skb)
 {
 	struct pppox_sock *po = pppox_sk(sk);
 
-	/* Backlog receive. Semantics of backlog rcv preclude any code from
-	 * executing in lock_sock()/release_sock() bounds; meaning sk->sk_state
-	 * can't change.
+	/* Re-test sk->sk_state, as it is read by pppoe_rcv() locklessly and may
+	 * have set PPPOX_BOUND when a skb reaches here.
 	 */
-
 	if (sk->sk_state & PPPOX_BOUND) {
 		ppp_input(&po->chan, skb);
 	} else {
@@ -371,7 +369,7 @@ abort_kfree:
 
 /************************************************************************
  *
- * Receive wrapper called in BH context.
+ * Receive a PPPoE Session frame.
  *
  ***********************************************************************/
 static int pppoe_rcv(struct sk_buff *skb, struct net_device *dev,
@@ -418,6 +416,10 @@ static int pppoe_rcv(struct sk_buff *skb, struct net_device *dev,
 	if (!po)
 		goto drop;
 
+	if (likely(po->sk.sk_state & PPPOX_BOUND)) {
+		ppp_input(&po->chan, skb);
+		return NET_RX_SUCCESS;
+	}
 	return __sk_receive_skb(&po->sk, skb, 0, 1, false);
 
 drop:
@@ -522,7 +524,7 @@ static int pppoe_create(struct net *net, struct socket *sock, int kern)
 	sock->state	= SS_UNCONNECTED;
 	sock->ops	= &pppoe_ops;
 
-	sk->sk_backlog_rcv	= pppoe_rcv_core;
+	sk->sk_backlog_rcv	= pppoe_backlog_rcv;
 	sk->sk_destruct		= pppoe_destruct;
 	sk->sk_state		= PPPOX_NONE;
 	sk->sk_type		= SOCK_STREAM;
@@ -623,6 +625,13 @@ static int pppoe_connect(struct socket *sock, struct sockaddr_unsized *uservaddr
 		pn = pppoe_pernet(sock_net(sk));
 		delete_item(pn, po->pppoe_pa.sid,
 			    po->pppoe_pa.remote, po->pppoe_ifindex);
+
+		/* pppoe_rcv() can call ppp_input() without taking the socket
+		 * lock. Once the socket is unhashed, wait for any receive path
+		 * that found it earlier before clearing and reusing the socket.
+		 */
+		synchronize_net();
+
 		if (po->pppoe_dev) {
 			dev_put(po->pppoe_dev);
 			po->pppoe_dev = NULL;
