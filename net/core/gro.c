@@ -229,10 +229,17 @@ done:
 
 int skb_gro_receive_list(struct sk_buff *p, struct sk_buff *skb)
 {
-	/* make sure to check flush flag and to not merge */
-	if (unlikely(p->len + skb->len >= 65536 ||
+	unsigned int len = skb_gro_len(skb);
+
+	if (unlikely(p->len + len >= netif_get_gro_max_size(p->dev, p) ||
 		     NAPI_GRO_CB(skb)->flush))
 		return -E2BIG;
+
+	if (unlikely(p->len + len >= GRO_LEGACY_MAX_SIZE)) {
+		if (NAPI_GRO_CB(skb)->proto != IPPROTO_TCP ||
+		    p->encapsulation)
+			return -E2BIG;
+	}
 
 	if (!pskb_may_pull(skb, skb_gro_offset(skb))) {
 		NAPI_GRO_CB(skb)->flush = 1;

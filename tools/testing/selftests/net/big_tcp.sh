@@ -165,6 +165,15 @@ testup() {
 	do_test "off" "on"  "off" "on"
 }
 
+test_fraglist() {
+	ip net exec $ROUTER_NS ethtool -K link1 rx-gro-list on || return $?
+
+	# Non-GSO input selects fraglist GRO on the forwarding interface.
+	echo "CLI GSO | GW GRO | GW GSO | SER GRO (fraglist)" && \
+	do_test "off" "on" "on"  "on" && \
+	do_test "off" "on" "off" "on"
+}
+
 if ! netperf -V &> /dev/null; then
 	echo "SKIP: Could not run test without netperf tool"
 	exit $ksft_skip
@@ -178,5 +187,7 @@ fi
 trap cleanup EXIT
 setup && echo "Testing for BIG TCP:" && \
 NF=4 testup && echo "***v4 Tests Done***" && \
-NF=6 testup && echo "***v6 Tests Done***"
+NF=6 testup && echo "***v6 Tests Done***" && \
+NF=4 test_fraglist && echo "***v4 Fraglist Tests Done***" && \
+NF=6 test_fraglist && echo "***v6 Fraglist Tests Done***"
 exit $?
