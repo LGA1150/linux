@@ -1636,6 +1636,8 @@ static void ppp_setup(struct net_device *dev)
 	dev->pcpu_stat_type = NETDEV_PCPU_STAT_TSTATS;
 	dev->features = NETIF_F_SG | NETIF_F_FRAGLIST;
 	dev->hw_features = dev->features;
+	/* TCP GSO packets are segmented in software before PPP processing. */
+	netif_set_tso_max_size(dev, GSO_MAX_SIZE);
 	netif_keep_dst(dev);
 }
 
