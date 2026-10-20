@@ -88,6 +88,7 @@
 #include <linux/proc_fs.h>
 #include <linux/l2tp.h>
 #include <linux/nsproxy.h>
+#include <linux/unaligned.h>
 #include <net/net_namespace.h>
 #include <net/netns/generic.h>
 #include <net/ip.h>
@@ -343,6 +344,23 @@ static int pppol2tp_xmit(struct ppp_channel *chan, struct sk_buff *skb)
 		goto abort;
 
 	tunnel = session->tunnel;
+
+	if (skb_is_gso(skb)) {
+		if (!pskb_may_pull(skb, sizeof(__be16)))
+			goto abort_put_sess;
+
+		switch (get_unaligned_be16(skb->data)) {
+		case PPP_IP:
+			skb->protocol = htons(ETH_P_IP);
+			break;
+		case PPP_IPV6:
+			skb->protocol = htons(ETH_P_IPV6);
+			break;
+		default:
+			goto abort_put_sess;
+		}
+		skb_set_network_header(skb, sizeof(__be16));
+	}
 
 	uhlen = (tunnel->encap == L2TP_ENCAPTYPE_UDP) ? sizeof(struct udphdr) : 0;
 	headroom = NET_SKB_PAD +
@@ -799,6 +817,7 @@ static int pppol2tp_connect(struct socket *sock, struct sockaddr_unsized *userva
 	po->chan.ops	 = &pppol2tp_chan_ops;
 	po->chan.mtu	 = pppol2tp_tunnel_mtu(tunnel);
 	po->chan.direct_xmit	= true;
+	po->chan.gso		= true;
 
 	error = ppp_register_net_channel(sock_net(sk), &po->chan);
 	if (error) {

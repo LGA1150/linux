@@ -45,6 +45,7 @@
 #include <net/net_namespace.h>
 #include <net/netns/generic.h>
 #include <net/dst.h>
+#include <net/gso.h>
 #include <net/ip.h>
 #include <net/udp.h>
 #include <net/udp_tunnel.h>
@@ -1136,9 +1137,20 @@ static void l2tp_udp_encap_err_recv(struct sock *sk, struct sk_buff *skb, int er
  * Transmit handling
  ***********************************************************************/
 
-/* Build an L2TP header for the session into the buffer provided.
- */
-static int l2tp_build_l2tpv2_header(struct l2tp_session *session, void *buf)
+static unsigned int l2tp_session_hdr_len(struct l2tp_session *session,
+					 int version, enum l2tp_encap_type encap,
+					 bool send_seq)
+{
+	if (version == L2TP_HDR_VER_2)
+		return 6 + (send_seq ? 4 : 0);
+
+	return 4 + session->cookie_len + l2tp_get_l2specific_len(session) +
+	       (encap == L2TP_ENCAPTYPE_UDP ? 4 : 0);
+}
+
+/* Build an L2TP header for the session into the buffer provided. */
+static int l2tp_build_l2tpv2_header(struct l2tp_session *session, void *buf,
+				    bool send_seq)
 {
 	struct l2tp_tunnel *tunnel = session->tunnel;
 	__be16 *bufp = buf;
@@ -1147,14 +1159,14 @@ static int l2tp_build_l2tpv2_header(struct l2tp_session *session, void *buf)
 	u32 tunnel_id = tunnel->peer_tunnel_id;
 	u32 session_id = session->peer_session_id;
 
-	if (session->send_seq)
+	if (send_seq)
 		flags |= L2TP_HDRFLAG_S;
 
 	/* Setup L2TP header. */
 	*bufp++ = htons(flags);
 	*bufp++ = htons(tunnel_id);
 	*bufp++ = htons(session_id);
-	if (session->send_seq) {
+	if (send_seq) {
 		*bufp++ = htons(session->ns);
 		*bufp++ = 0;
 		session->ns++;
@@ -1165,7 +1177,8 @@ static int l2tp_build_l2tpv2_header(struct l2tp_session *session, void *buf)
 	return bufp - optr;
 }
 
-static int l2tp_build_l2tpv3_header(struct l2tp_session *session, void *buf)
+static int l2tp_build_l2tpv3_header(struct l2tp_session *session, void *buf,
+				    bool send_seq)
 {
 	struct l2tp_tunnel *tunnel = session->tunnel;
 	char *bufp = buf;
@@ -1191,7 +1204,7 @@ static int l2tp_build_l2tpv3_header(struct l2tp_session *session, void *buf)
 	if (session->l2specific_type == L2TP_L2SPECTYPE_DEFAULT) {
 		u32 l2h = 0;
 
-		if (session->send_seq) {
+		if (send_seq) {
 			l2h = 0x40000000 | session->ns;
 			session->ns++;
 			session->ns &= 0xffffff;
@@ -1222,9 +1235,12 @@ static int l2tp_xmit_queue(struct l2tp_tunnel *tunnel, struct sk_buff *skb, stru
 	return err >= 0 ? NET_XMIT_SUCCESS : NET_XMIT_DROP;
 }
 
-static int l2tp_xmit_core(struct l2tp_session *session, struct sk_buff *skb, unsigned int *len)
+static int l2tp_xmit_core(struct l2tp_session *session, struct sk_buff *skb,
+			  unsigned int *len, bool send_seq)
 {
 	struct l2tp_tunnel *tunnel = session->tunnel;
+	unsigned int hdr_len = l2tp_session_hdr_len(session, tunnel->version,
+						  tunnel->encap, send_seq);
 	unsigned int data_len = skb->len;
 	struct sock *sk = tunnel->sock;
 	int headroom, uhlen, udp_len;
@@ -1237,7 +1253,7 @@ static int l2tp_xmit_core(struct l2tp_session *session, struct sk_buff *skb, uns
 	 * make room. Adjust truesize.
 	 */
 	uhlen = (tunnel->encap == L2TP_ENCAPTYPE_UDP) ? sizeof(*uh) : 0;
-	headroom = NET_SKB_PAD + sizeof(struct iphdr) + uhlen + session->hdr_len;
+	headroom = NET_SKB_PAD + sizeof(struct ipv6hdr) + uhlen + hdr_len;
 	if (skb_cow_head(skb, headroom)) {
 		kfree_skb(skb);
 		return NET_XMIT_DROP;
@@ -1245,9 +1261,11 @@ static int l2tp_xmit_core(struct l2tp_session *session, struct sk_buff *skb, uns
 
 	/* Setup L2TP header */
 	if (tunnel->version == L2TP_HDR_VER_2)
-		l2tp_build_l2tpv2_header(session, __skb_push(skb, session->hdr_len));
+		l2tp_build_l2tpv2_header(session, __skb_push(skb, hdr_len),
+					 send_seq);
 	else
-		l2tp_build_l2tpv3_header(session, __skb_push(skb, session->hdr_len));
+		l2tp_build_l2tpv3_header(session, __skb_push(skb, hdr_len),
+					 send_seq);
 
 	/* Reset control buffer */
 	memset(skb->cb, 0, sizeof(skb->cb));
@@ -1290,7 +1308,7 @@ static int l2tp_xmit_core(struct l2tp_session *session, struct sk_buff *skb, uns
 		uh = udp_hdr(skb);
 		uh->source = inet->inet_sport;
 		uh->dest = inet->inet_dport;
-		udp_len = uhlen + session->hdr_len + data_len;
+		udp_len = uhlen + hdr_len + data_len;
 		if (udp_len > U16_MAX) {
 			kfree_skb(skb);
 			ret = NET_XMIT_DROP;
@@ -1327,20 +1345,72 @@ out_unlock:
  */
 int l2tp_xmit_skb(struct l2tp_session *session, struct sk_buff *skb)
 {
+	struct l2tp_tunnel *tunnel = session->tunnel;
+	bool send_seq = session->send_seq;
+	struct sk_buff *segs, *next;
 	unsigned int len = 0;
-	int ret;
+	int ret = NET_XMIT_SUCCESS;
 
-	ret = l2tp_xmit_core(session, skb, &len);
-	if (ret == NET_XMIT_SUCCESS) {
-		atomic_long_inc(&session->tunnel->stats.tx_packets);
-		atomic_long_add(len, &session->tunnel->stats.tx_bytes);
-		atomic_long_inc(&session->stats.tx_packets);
-		atomic_long_add(len, &session->stats.tx_bytes);
-	} else {
-		atomic_long_inc(&session->tunnel->stats.tx_errors);
-		atomic_long_inc(&session->stats.tx_errors);
+	skb->next = NULL;
+	if (skb_is_gso(skb)) {
+		/* Generic tunnel GSO copies L2TP headers unchanged. Sequence
+		 * numbers must instead be allocated after segmentation. Use
+		 * this same sequencing snapshot when building the headers.
+		 */
+		if (send_seq || tunnel->encap != L2TP_ENCAPTYPE_UDP ||
+		    skb->encapsulation ||
+		    skb->len > U16_MAX - sizeof(struct ipv6hdr) -
+			       sizeof(struct udphdr) - L2TP_HDR_SIZE_MAX - 8) {
+			segs = skb_gso_segment(skb, 0);
+			if (IS_ERR_OR_NULL(segs))
+				goto drop;
+			consume_skb(skb);
+			skb = segs;
+		} else {
+			bool udp_csum = !tunnel->sock->sk_no_check_tx;
+
+#if IS_ENABLED(CONFIG_IPV6)
+			if (l2tp_sk_is_v6(tunnel->sock))
+				udp_csum = !udp_get_no_check6_tx(tunnel->sock);
+#endif
+			skb_reset_mac_header(skb);
+			if (udp_tunnel_handle_offloads(skb, udp_csum))
+				goto drop;
+
+			/* Treat the pseudowire header as part of the tunnel,
+			 * with a bare IP packet as its inner payload.
+			 */
+			skb_set_inner_mac_header(skb, skb_network_offset(skb));
+			skb_set_inner_protocol(skb, skb->protocol);
+			if (skb_shinfo(skb)->gso_type & SKB_GSO_TCP_FIXEDID) {
+				skb_shinfo(skb)->gso_type &= ~SKB_GSO_TCP_FIXEDID;
+				skb_shinfo(skb)->gso_type |= SKB_GSO_TCP_FIXEDID_INNER;
+			}
+		}
 	}
+
+	skb_list_walk_safe(skb, skb, next) {
+		skb->next = NULL;
+		if (l2tp_xmit_core(session, skb, &len, send_seq) ==
+		    NET_XMIT_SUCCESS) {
+			atomic_long_inc(&tunnel->stats.tx_packets);
+			atomic_long_add(len, &tunnel->stats.tx_bytes);
+			atomic_long_inc(&session->stats.tx_packets);
+			atomic_long_add(len, &session->stats.tx_bytes);
+		} else {
+			atomic_long_inc(&tunnel->stats.tx_errors);
+			atomic_long_inc(&session->stats.tx_errors);
+			ret = NET_XMIT_DROP;
+		}
+	}
+
 	return ret;
+
+drop:
+	kfree_skb(skb);
+	atomic_long_inc(&tunnel->stats.tx_errors);
+	atomic_long_inc(&session->stats.tx_errors);
+	return NET_XMIT_DROP;
 }
 EXPORT_SYMBOL_GPL(l2tp_xmit_skb);
 
@@ -1765,16 +1835,8 @@ static void l2tp_session_del_work(struct work_struct *work)
 void l2tp_session_set_header_len(struct l2tp_session *session, int version,
 				 enum l2tp_encap_type encap)
 {
-	if (version == L2TP_HDR_VER_2) {
-		session->hdr_len = 6;
-		if (session->send_seq)
-			session->hdr_len += 4;
-	} else {
-		session->hdr_len = 4 + session->cookie_len;
-		session->hdr_len += l2tp_get_l2specific_len(session);
-		if (encap == L2TP_ENCAPTYPE_UDP)
-			session->hdr_len += 4;
-	}
+	session->hdr_len = l2tp_session_hdr_len(session, version, encap,
+						session->send_seq);
 }
 EXPORT_SYMBOL_GPL(l2tp_session_set_header_len);
 
