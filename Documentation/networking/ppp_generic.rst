@@ -140,6 +140,13 @@ PPP layer will attempt to provide that much headroom but the channel
 should still check if there is sufficient headroom and copy the skbuff
 if there isn't.
 
+A channel that accepts GSO packets from a bridged peer should set the
+``gso`` field before registering and keep it unchanged while registered.
+The channel must prepare the GSO metadata for its encapsulation or segment
+the packet before transmitting it. Other channels receive individual
+frames. Channels without ``direct_xmit`` also receive linear buffers with
+completed checksums, including when the incoming frame was not GSO.
+
 On the input side, channels should ideally provide at least 2 bytes of
 headroom in the skbuffs presented to ppp_input().  The generic PPP
 code does not require this but will be more efficient if this is done.

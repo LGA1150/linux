@@ -2279,9 +2279,8 @@ static bool ppp_decompress_proto(struct sk_buff *skb)
 	return pskb_may_pull(skb, 2);
 }
 
-/* Channels accept individual PPP frames, not GSO packets. Keep the PPP
- * protocol field as a link-layer header so segmentation copies it to each
- * output frame, independently of the incoming channel's encapsulation.
+/* Keep the PPP protocol field as a link-layer header so segmentation copies
+ * it to each output frame, independently of the incoming encapsulation.
  */
 static struct sk_buff *ppp_bridge_segment(struct sk_buff *skb)
 {
@@ -2336,11 +2335,18 @@ static bool ppp_channel_bridge_input(struct channel *pch, struct sk_buff *skb)
 	}
 
 	skb->next = NULL;
-	if (skb_is_gso(skb))
+	if (skb_is_gso(skb) && !pchb->chan->gso)
 		skb = ppp_bridge_segment(skb);
 
 	skb_list_walk_safe(skb, skb, next) {
 		skb->next = NULL;
+		if (!pchb->chan->direct_xmit &&
+		    (skb_linearize(skb) ||
+		     (skb->ip_summed == CHECKSUM_PARTIAL &&
+		      skb_checksum_help(skb)))) {
+			kfree_skb(skb);
+			continue;
+		}
 		skb_scrub_packet(skb, !net_eq(pch->chan_net, pchb->chan_net));
 		if (!pchb->chan->ops->start_xmit(pchb->chan, skb))
 			kfree_skb(skb);
