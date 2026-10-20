@@ -175,6 +175,8 @@ static struct sk_buff *__skb_udp_tunnel_segment(struct sk_buff *skb,
 					     netdev_features_t features),
 	__be16 new_protocol, bool is_ipv6)
 {
+	const u32 fixedid_mask = SKB_GSO_TCP_FIXEDID |
+				SKB_GSO_TCP_FIXEDID_INNER;
 	int tnl_hlen = skb_inner_mac_header(skb) - skb_transport_header(skb);
 	bool remcsum, need_csum, offload_csum, gso_partial;
 	struct sk_buff *segs = ERR_PTR(-EINVAL);
@@ -185,9 +187,14 @@ static struct sk_buff *__skb_udp_tunnel_segment(struct sk_buff *skb,
 	struct udphdr *uh;
 	__wsum partial;
 	bool need_ipsec;
+	u32 fixedid;
 
 	if (unlikely(!pskb_may_pull(skb, tnl_hlen)))
 		goto out;
+
+	fixedid = skb_shinfo(skb)->gso_type & fixedid_mask;
+	if (fixedid && skb_unclone(skb, GFP_ATOMIC))
+		return ERR_PTR(-ENOMEM);
 
 	uh = udp_hdr(skb);
 
@@ -241,8 +248,21 @@ static struct sk_buff *__skb_udp_tunnel_segment(struct sk_buff *skb,
 			features |= NETIF_F_HW_CSUM;
 	}
 
+	/* The inner segmenter starts at encap_level zero. Translate its
+	 * fixed-ID flag for that view, then restore the tunnel's flags.
+	 */
+	if (fixedid) {
+		skb_shinfo(skb)->gso_type &= ~fixedid_mask;
+		skb_shinfo(skb)->gso_type |=
+			(fixedid & SKB_GSO_TCP_FIXEDID_INNER) >> 1;
+	}
+
 	/* segment inner packet. */
 	segs = gso_inner_segment(skb, features);
+	if (fixedid && skb_is_gso(skb)) {
+		skb_shinfo(skb)->gso_type &= ~fixedid_mask;
+		skb_shinfo(skb)->gso_type |= fixedid;
+	}
 	if (IS_ERR_OR_NULL(segs)) {
 		skb_gso_error_unwind(skb, protocol, tnl_hlen, mac_offset,
 				     mac_len);
@@ -256,6 +276,11 @@ static struct sk_buff *__skb_udp_tunnel_segment(struct sk_buff *skb,
 	skb = segs;
 	do {
 		unsigned int len;
+
+		if (fixedid && skb_is_gso(skb)) {
+			skb_shinfo(skb)->gso_type &= ~fixedid_mask;
+			skb_shinfo(skb)->gso_type |= fixedid;
+		}
 
 		if (remcsum)
 			skb->ip_summed = CHECKSUM_NONE;
