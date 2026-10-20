@@ -3793,10 +3793,6 @@ static netdev_features_t harmonize_features(struct sk_buff *skb,
 	type = skb_network_protocol(skb, NULL);
 	features = net_mpls_features(skb, features, type);
 
-	/* Ordinary TSO does not update the PPPoE payload length. */
-	if (type == htons(ETH_P_PPP_SES))
-		features &= ~NETIF_F_GSO_MASK;
-
 	if (skb->ip_summed != CHECKSUM_NONE &&
 	    !can_checksum_protocol(features, type)) {
 		features &= ~(NETIF_F_CSUM_MASK | NETIF_F_GSO_MASK);

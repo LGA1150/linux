@@ -441,6 +441,8 @@ static void nf_flow_encap_pop(struct nf_flowtable_ctx *ctx,
 			skb_reset_network_header(skb);
 			break;
 		case htons(ETH_P_PPP_SES):
+			if (skb_is_gso(skb))
+				skb_shinfo(skb)->gso_type &= ~SKB_GSO_PPPOE;
 			skb->protocol = __nf_flow_pppoe_proto(skb);
 			skb_pull_rcsum(skb, PPPOE_SES_HLEN);
 			skb_reset_network_header(skb);
@@ -495,7 +497,8 @@ static int nf_flow_offload_forward(struct nf_flowtable_ctx *ctx,
 		return 0;
 	}
 
-	if (skb_ensure_writable(skb, thoff + ctx->hdrsize))
+	if (skb_ensure_writable(skb, thoff + ctx->hdrsize) ||
+	    (skb_is_gso(skb) && skb_unclone(skb, GFP_ATOMIC)))
 		return -1;
 
 	flow_offload_refresh(flow_table, flow, false);
@@ -576,6 +579,8 @@ static int nf_flow_pppoe_push(struct sk_buff *skb, u16 id,
 	ph->hdr.length	= htons(data_len);
 	ph->proto	= proto;
 	skb->protocol	= htons(ETH_P_PPP_SES);
+	if (skb_is_gso(skb))
+		skb_shinfo(skb)->gso_type |= SKB_GSO_PPPOE;
 
 	return 0;
 }
@@ -1058,7 +1063,8 @@ static int nf_flow_offload_ipv6_forward(struct nf_flowtable_ctx *ctx,
 		return 0;
 	}
 
-	if (skb_ensure_writable(skb, thoff + ctx->hdrsize))
+	if (skb_ensure_writable(skb, thoff + ctx->hdrsize) ||
+	    (skb_is_gso(skb) && skb_unclone(skb, GFP_ATOMIC)))
 		return -1;
 
 	flow_offload_refresh(flow_table, flow, false);
