@@ -45,6 +45,7 @@
 #include <linux/slab.h>
 #include <linux/file.h>
 #include <linux/unaligned.h>
+#include <net/gso.h>
 #include <net/netdev_lock.h>
 #include <net/slhc_vj.h>
 #include <linux/atomic.h>
@@ -2278,6 +2279,40 @@ static bool ppp_decompress_proto(struct sk_buff *skb)
 	return pskb_may_pull(skb, 2);
 }
 
+/* Channels accept individual PPP frames, not GSO packets. Keep the PPP
+ * protocol field as a link-layer header so segmentation copies it to each
+ * output frame, independently of the incoming channel's encapsulation.
+ */
+static struct sk_buff *ppp_bridge_segment(struct sk_buff *skb)
+{
+	struct sk_buff *segs;
+
+	if (!pskb_may_pull(skb, PPP_PROTO_LEN) || skb_cow_head(skb, 0))
+		goto drop;
+
+	switch (PPP_PROTO(skb)) {
+	case PPP_IP:
+		skb->protocol = htons(ETH_P_IP);
+		break;
+	case PPP_IPV6:
+		skb->protocol = htons(ETH_P_IPV6);
+		break;
+	default:
+		goto drop;
+	}
+	skb_set_network_header(skb, PPP_PROTO_LEN);
+	segs = skb_gso_segment(skb, 0);
+	if (IS_ERR_OR_NULL(segs))
+		goto drop;
+
+	consume_skb(skb);
+	return segs;
+
+drop:
+	kfree_skb(skb);
+	return NULL;
+}
+
 /* Attempt to handle a frame via. a bridged channel, if one exists.
  * If the channel is bridged, the frame is consumed by the bridge.
  * If not, the caller must handle the frame by normal recv mechanisms.
@@ -2285,6 +2320,7 @@ static bool ppp_decompress_proto(struct sk_buff *skb)
  */
 static bool ppp_channel_bridge_input(struct channel *pch, struct sk_buff *skb)
 {
+	struct sk_buff *next;
 	struct channel *pchb;
 
 	rcu_read_lock();
@@ -2299,9 +2335,16 @@ static bool ppp_channel_bridge_input(struct channel *pch, struct sk_buff *skb)
 		goto outl;
 	}
 
-	skb_scrub_packet(skb, !net_eq(pch->chan_net, pchb->chan_net));
-	if (!pchb->chan->ops->start_xmit(pchb->chan, skb))
-		kfree_skb(skb);
+	skb->next = NULL;
+	if (skb_is_gso(skb))
+		skb = ppp_bridge_segment(skb);
+
+	skb_list_walk_safe(skb, skb, next) {
+		skb->next = NULL;
+		skb_scrub_packet(skb, !net_eq(pch->chan_net, pchb->chan_net));
+		if (!pchb->chan->ops->start_xmit(pchb->chan, skb))
+			kfree_skb(skb);
+	}
 
 outl:
 	spin_unlock_bh(&pchb->downl);
