@@ -411,6 +411,12 @@ static int pppoe_rcv(struct sk_buff *skb, struct net_device *dev,
 	if (!skb_is_gso(skb) && pskb_trim_rcsum(skb, len))
 		goto drop;
 
+	if (skb_is_gso(skb)) {
+		if (skb_unclone(skb, GFP_ATOMIC))
+			goto drop;
+		skb_shinfo(skb)->gso_type &= ~SKB_GSO_PPPOE;
+	}
+
 	ph = pppoe_hdr(skb);
 	pn = pppoe_pernet(dev_net(dev));
 
@@ -880,6 +886,8 @@ static int pppoe_xmit(struct ppp_channel *chan, struct sk_buff *skb)
 	ph->length = htons(data_len);
 
 	skb->protocol = cpu_to_be16(ETH_P_PPP_SES);
+	if (skb_is_gso(skb))
+		skb_shinfo(skb)->gso_type |= SKB_GSO_PPPOE;
 	skb->dev = dev;
 
 	dev_hard_header(skb, dev, ETH_P_PPP_SES,
@@ -1181,6 +1189,7 @@ static int pppoe_gro_complete(struct sk_buff *skb, int nhoff)
 	__be16 type = pppoe_hdr_proto(phdr);
 	struct packet_offload *ptype;
 	unsigned int len;
+	int err;
 
 	ptype = gro_find_complete_by_type(type);
 	if (!ptype)
@@ -1190,9 +1199,12 @@ static int pppoe_gro_complete(struct sk_buff *skb, int nhoff)
 	len = min(len, 0xFFFFU);
 	phdr->length = cpu_to_be16(len);
 
-	return INDIRECT_CALL_INET(ptype->callbacks.gro_complete,
-				  ipv6_gro_complete, inet_gro_complete,
-				  skb, nhoff + PPPOE_SES_HLEN);
+	err = INDIRECT_CALL_INET(ptype->callbacks.gro_complete,
+				 ipv6_gro_complete, inet_gro_complete,
+				 skb, nhoff + PPPOE_SES_HLEN);
+	if (!err)
+		skb_shinfo(skb)->gso_type |= SKB_GSO_PPPOE;
+	return err;
 }
 
 static struct sk_buff *pppoe_gso_segment(struct sk_buff *skb,
@@ -1209,6 +1221,9 @@ static struct sk_buff *pppoe_gso_segment(struct sk_buff *skb,
 
 	if (unlikely(!pskb_may_pull(skb, PPPOE_SES_HLEN)))
 		goto out;
+	if (skb_unclone(skb, GFP_ATOMIC))
+		return ERR_PTR(-ENOMEM);
+	skb_shinfo(skb)->gso_type &= ~SKB_GSO_PPPOE;
 
 	phdr = (struct pppoe_hdr *)skb_network_header(skb);
 	type = pppoe_hdr_proto(phdr);
