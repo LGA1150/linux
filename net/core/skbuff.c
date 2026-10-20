@@ -4723,7 +4723,6 @@ struct sk_buff *skb_segment_list(struct sk_buff *skb,
 			if (tmp) {
 				consume_skb(nskb);
 				nskb = tmp;
-				err = skb_unclone(nskb, GFP_ATOMIC);
 			} else {
 				err = -ENOMEM;
 			}
@@ -4742,6 +4741,12 @@ struct sk_buff *skb_segment_list(struct sk_buff *skb,
 		tail = nskb;
 
 		delta_len += nskb->len;
+
+		/* Encapsulation may have grown since GRO built the frag_list. */
+		err = skb_cow_head(nskb, tnl_hlen + offset -
+					skb_network_offset(nskb));
+		if (unlikely(err))
+			goto err_linearize;
 
 		skb_push(nskb, -skb_network_offset(nskb) + offset);
 
