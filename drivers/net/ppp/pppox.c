@@ -17,6 +17,7 @@
 #include <linux/string.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
+#include <linux/capability.h>
 #include <linux/compat.h>
 #include <linux/errno.h>
 #include <linux/netdevice.h>
@@ -132,6 +133,9 @@ static int pppox_create(struct net *net, struct socket *sock, int protocol,
 
 	if (protocol < 0 || protocol > PX_MAX_PROTO)
 		goto out;
+
+	if (!kern && !ns_capable(net->user_ns, CAP_NET_ADMIN))
+		return -EPERM;
 
 	rc = -EPROTONOSUPPORT;
 	if (!pppox_protos[protocol])
