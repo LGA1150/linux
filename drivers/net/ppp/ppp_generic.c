@@ -2299,6 +2299,11 @@ static bool ppp_channel_bridge_input(struct channel *pch, struct sk_buff *skb)
 		goto outl;
 	}
 
+	if (!pchb->chan->direct_xmit && skb_linearize(skb)) {
+		kfree_skb(skb);
+		goto outl;
+	}
+
 	skb_scrub_packet(skb, !net_eq(pch->chan_net, pchb->chan_net));
 	if (!pchb->chan->ops->start_xmit(pchb->chan, skb))
 		kfree_skb(skb);
