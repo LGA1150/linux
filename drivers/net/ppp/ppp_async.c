@@ -100,8 +100,8 @@ static int ppp_async_ioctl(struct ppp_channel *chan, unsigned int cmd,
 			   unsigned long arg);
 static void ppp_async_process(struct tasklet_struct *t);
 
-static void async_lcp_peek(struct asyncppp *ap, unsigned char *data,
-			   int len, int inbound);
+static void async_lcp_peek(struct asyncppp *ap, struct sk_buff *skb,
+			   int inbound);
 
 static const struct ppp_channel_ops async_ops = {
 	.start_xmit = ppp_async_send,
@@ -149,6 +149,7 @@ ppp_asynctty_open(struct tty_struct *tty)
 	ap->chan.private = ap;
 	ap->chan.ops = &async_ops;
 	ap->chan.mtu = PPP_MRU;
+	ap->chan.xmit_flags = PPP_CHANNEL_SG;
 	speed = tty_get_baud_rate(tty);
 	ap->chan.speed = speed;
 	err = ppp_register_channel(&ap->chan);
@@ -453,30 +454,32 @@ static void ppp_async_process(struct tasklet_struct *t)
 static int
 ppp_async_encode(struct asyncppp *ap)
 {
-	int fcs, i, count, c, proto;
-	unsigned char *buf, *buflim;
-	unsigned char *data;
+	int fcs, i, count, c, proto, len;
+	unsigned char *buf, *buflim, *data;
 	int islcp;
 
 	buf = ap->obuf;
 	ap->olim = buf;
 	ap->optr = buf;
 	i = ap->tpkt_pos;
-	data = ap->tpkt->data;
 	count = ap->tpkt->len;
+	if (count < 2)
+		goto drop;
+	if (skb_copy_bits(ap->tpkt, 0, buf, min(count, 3)))
+		goto drop;
 	fcs = ap->tfcs;
-	proto = get_unaligned_be16(data);
+	proto = get_unaligned_be16(buf);
 
 	/*
 	 * LCP packets with code values between 1 (configure-request)
 	 * and 7 (code-reject) must be sent as though no options
 	 * had been negotiated.
 	 */
-	islcp = proto == PPP_LCP && count >= 3 && 1 <= data[2] && data[2] <= 7;
+	islcp = proto == PPP_LCP && count >= 3 && 1 <= buf[2] && buf[2] <= 7;
 
 	if (i == 0) {
 		if (islcp)
-			async_lcp_peek(ap, data, count, 0);
+			async_lcp_peek(ap, ap->tpkt, 0);
 
 		/*
 		 * Start of a new packet - insert the leading FLAG
@@ -500,17 +503,26 @@ ppp_async_encode(struct asyncppp *ap)
 	}
 
 	/*
-	 * Once we put in the last byte, we need to put in the FCS
-	 * and closing flag, so make sure there is at least 7 bytes
-	 * of free space in the output buffer.
+	 * Reserve space for the escaped FCS and closing flag.
 	 */
-	buflim = ap->obuf + OBUFSIZE - 6;
-	while (i < count && buf < buflim) {
-		c = data[i++];
-		if (i == 1 && c == 0 && (ap->flags & SC_COMP_PROT))
-			continue;	/* compress protocol field */
-		fcs = PPP_FCS(fcs, c);
-		PUT_BYTE(ap, buf, c, islcp);
+	buflim = ap->obuf + OBUFSIZE - 5;
+	while (i < count && buf + 1 < buflim) {
+		/*
+		 * Stage bytes ahead of the output cursor. The gap of len
+		 * bytes lets every byte expand to two without overwriting
+		 * unread input. Refill using any space left after escaping.
+		 */
+		len = min_t(int, count - i, (buflim - buf) / 2);
+		data = buf + len;
+		if (skb_copy_bits(ap->tpkt, i, data, len))
+			goto drop;
+		do {
+			c = *data++;
+			if (++i == 1 && c == 0 && (ap->flags & SC_COMP_PROT))
+				continue;	/* compress protocol field */
+			fcs = PPP_FCS(fcs, c);
+			PUT_BYTE(ap, buf, c, islcp);
+		} while (--len);
 	}
 
 	if (i < count) {
@@ -535,6 +547,14 @@ ppp_async_encode(struct asyncppp *ap)
 	ap->olim = buf;
 
 	consume_skb(ap->tpkt);
+	ap->tpkt = NULL;
+	return 1;
+
+drop:
+	/* Terminate any part of the frame already sent to the tty. */
+	ap->obuf[0] = PPP_FLAG;
+	ap->olim = ap->obuf + 1;
+	kfree_skb(ap->tpkt);
 	ap->tpkt = NULL;
 	return 1;
 }
@@ -729,7 +749,7 @@ process_input_packet(struct asyncppp *ap)
 			goto err;
 		proto = (p[0] << 8) + p[1];
 		if (proto == PPP_LCP)
-			async_lcp_peek(ap, p, skb->len, 1);
+			async_lcp_peek(ap, skb, 1);
 	}
 
 	/* queue the frame to be processed */
@@ -868,21 +888,23 @@ ppp_async_input(struct asyncppp *ap, const u8 *buf, const u8 *flags, int count)
 #define LCP_MRU		1	/* LCP option numbers */
 #define LCP_ASYNCMAP	2
 
-static void async_lcp_peek(struct asyncppp *ap, unsigned char *data,
-			   int len, int inbound)
+static void async_lcp_peek(struct asyncppp *ap, struct sk_buff *skb,
+			   int inbound)
 {
-	int dlen, fcs, i, code;
+	unsigned char scratch[128];
+	const unsigned char *data;
+	int dlen, fcs, i, code, len;
 	u32 val;
 
-	data += 2;		/* skip protocol bytes */
-	len -= 2;
-	if (len < 4)		/* 4 = code, ID, length */
+	/* Skip protocol bytes; read code, ID and length. */
+	data = skb_header_pointer(skb, 2, 4, scratch);
+	if (!data)
 		return;
 	code = data[0];
 	if (code != CONFACK && code != CONFREQ)
 		return;
 	dlen = get_unaligned_be16(data + 2);
-	if (len < dlen)
+	if (dlen < 4 || dlen > skb->len - 2)
 		return;		/* packet got truncated or length is bogus */
 
 	if (code == (inbound? CONFACK: CONFREQ)) {
@@ -891,8 +913,13 @@ static void async_lcp_peek(struct asyncppp *ap, unsigned char *data,
 		 * calculate the crc of the data from the ID field on.
 		 */
 		fcs = PPP_INITFCS;
-		for (i = 1; i < dlen; ++i)
-			fcs = PPP_FCS(fcs, data[i]);
+		for (i = 3; i < dlen + 2; i += len) {
+			len = min_t(int, dlen + 2 - i, sizeof(scratch));
+			data = skb_header_pointer(skb, i, len, scratch);
+			if (!data)
+				return;
+			fcs = crc_ccitt(fcs, data, len);
+		}
 
 		if (!inbound) {
 			/* outbound confreq - remember the crc for later */
@@ -909,28 +936,39 @@ static void async_lcp_peek(struct asyncppp *ap, unsigned char *data,
 		return;	/* not interested in received confreq */
 
 	/* process the options in the confack */
-	data += 4;
-	dlen -= 4;
-	/* data[0] is code, data[1] is length */
-	while (dlen >= 2 && dlen >= data[1] && data[1] >= 2) {
+	for (i = 6; i + 2 <= dlen + 2; i += len) {
+		data = skb_header_pointer(skb, i, 2, scratch);
+		if (!data)
+			return;
+		len = data[1];
+		if (len < 2 || len > dlen + 2 - i)
+			return;
 		switch (data[0]) {
 		case LCP_MRU:
-			val = get_unaligned_be16(data + 2);
+			if (len != 4)
+				return;
+			data = skb_header_pointer(skb, i + 2, 2, scratch);
+			if (!data)
+				return;
+			val = get_unaligned_be16(data);
 			if (inbound)
 				ap->mru = val;
 			else
 				ap->chan.mtu = val;
 			break;
 		case LCP_ASYNCMAP:
-			val = get_unaligned_be32(data + 2);
+			if (len != 6)
+				return;
+			data = skb_header_pointer(skb, i + 2, 4, scratch);
+			if (!data)
+				return;
+			val = get_unaligned_be32(data);
 			if (inbound)
 				ap->raccm = val;
 			else
 				ap->xaccm[0] = val;
 			break;
 		}
-		dlen -= data[1];
-		data += data[1];
 	}
 }
 
