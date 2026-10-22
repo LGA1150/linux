@@ -466,7 +466,7 @@ static int pptp_connect(struct socket *sock, struct sockaddr_unsized *uservaddr,
 	po->chan.mtu -= PPTP_HEADER_OVERHEAD;
 
 	po->chan.hdrlen = 2 + sizeof(struct pptp_gre_header);
-	po->chan.direct_xmit = true;
+	po->chan.xmit_flags = PPP_CHANNEL_NO_QDISC | PPP_CHANNEL_SG;
 	error = ppp_register_channel(&po->chan);
 	if (error) {
 		pr_err("PPTP: failed to register PPP channel (%d)\n", error);

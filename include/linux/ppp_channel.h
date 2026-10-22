@@ -15,6 +15,7 @@
  * ==FILEVERSION 20000322==
  */
 
+#include <linux/bits.h>
 #include <linux/list.h>
 #include <linux/skbuff.h>
 #include <linux/poll.h>
@@ -35,6 +36,13 @@ struct ppp_channel_ops {
 				     const struct ppp_channel *);
 };
 
+/* Transmit capabilities, independent of one another. */
+enum {
+	PPP_CHANNEL_NO_QDISC	= BIT(0),
+	PPP_CHANNEL_SG		= BIT(1), /* accepts page frags and frag_list */
+	PPP_CHANNEL_OFFLOAD	= BIT(2), /* accepts GSO and CHECKSUM_PARTIAL */
+};
+
 struct ppp_channel {
 	void		*private;	/* channel private data */
 	const struct ppp_channel_ops *ops; /* operations for this channel */
@@ -42,8 +50,7 @@ struct ppp_channel {
 	int		hdrlen;		/* amount of headroom channel needs */
 	void		*ppp;		/* opaque to channel */
 	int		speed;		/* transfer rate (bytes/second) */
-	bool		direct_xmit;	/* no qdisc, xmit directly */
-	bool		xmit_offload;	/* accepts GSO and CHECKSUM_PARTIAL skbs */
+	unsigned int	xmit_flags;	/* PPP_CHANNEL_* transmit capabilities */
 };
 
 #ifdef __KERNEL__

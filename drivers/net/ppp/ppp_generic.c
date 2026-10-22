@@ -1924,7 +1924,8 @@ ppp_push(struct ppp *ppp, struct sk_buff *skb)
 
 		spin_lock(&pch->downl);
 		chan = pch->chan;
-		if (unlikely(!chan->direct_xmit && skb_linearize(skb))) {
+		if (unlikely(!(chan->xmit_flags & PPP_CHANNEL_SG) &&
+			     skb_linearize(skb))) {
 			/* channel requires a linear skb but linearization
 			 * failed
 			 */
@@ -2285,7 +2286,8 @@ static bool ppp_decompress_proto(struct sk_buff *skb)
  * in front of each segment.
  * Returns a list of segments, or NULL if the packet was dropped.
  */
-static struct sk_buff *ppp_bridge_gso_segment(struct sk_buff *skb)
+static struct sk_buff *ppp_bridge_gso_segment(struct sk_buff *skb,
+					      unsigned int xmit_flags)
 {
 	struct sk_buff *segs;
 
@@ -2304,7 +2306,7 @@ static struct sk_buff *ppp_bridge_gso_segment(struct sk_buff *skb)
 	}
 	skb_set_network_header(skb, PPP_PROTO_LEN);
 
-	segs = skb_gso_segment(skb, 0);
+	segs = skb_gso_segment(skb, xmit_flags & PPP_CHANNEL_SG ? NETIF_F_SG : 0);
 	if (IS_ERR_OR_NULL(segs))
 		goto drop;
 
@@ -2318,10 +2320,11 @@ drop:
 
 static void ppp_bridge_xmit(struct ppp_channel *chan, struct sk_buff *skb)
 {
-	if (!chan->direct_xmit && skb_linearize(skb))
+	if (!(chan->xmit_flags & PPP_CHANNEL_SG) && skb_linearize(skb))
 		goto drop;
 
-	if (!chan->xmit_offload && skb->ip_summed == CHECKSUM_PARTIAL &&
+	if (!(chan->xmit_flags & PPP_CHANNEL_OFFLOAD) &&
+	    skb->ip_summed == CHECKSUM_PARTIAL &&
 	    skb_checksum_help(skb))
 		goto drop;
 
@@ -2357,8 +2360,8 @@ static bool ppp_channel_bridge_input(struct channel *pch, struct sk_buff *skb)
 	skb_scrub_packet(skb, !net_eq(pch->chan_net, pchb->chan_net));
 
 	chan = pchb->chan;
-	if (!chan->xmit_offload && skb_is_gso(skb)) {
-		segs = ppp_bridge_gso_segment(skb);
+	if (!(chan->xmit_flags & PPP_CHANNEL_OFFLOAD) && skb_is_gso(skb)) {
+		segs = ppp_bridge_gso_segment(skb, chan->xmit_flags);
 		skb_list_walk_safe(segs, skb, next) {
 			skb_mark_not_on_list(skb);
 			ppp_bridge_xmit(chan, skb);
@@ -3589,7 +3592,7 @@ ppp_connect_channel(struct channel *pch, int unit)
 		ret = -ENOTCONN;
 		goto outl;
 	}
-	if (pch->chan->direct_xmit)
+	if (pch->chan->xmit_flags & PPP_CHANNEL_NO_QDISC)
 		dev->priv_flags |= IFF_NO_QUEUE;
 	else
 		dev->priv_flags &= ~IFF_NO_QUEUE;

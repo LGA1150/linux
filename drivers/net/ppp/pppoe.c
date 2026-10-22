@@ -668,8 +668,8 @@ static int pppoe_connect(struct socket *sock, struct sockaddr_unsized *uservaddr
 		po->chan.mtu = dev->mtu - sizeof(struct pppoe_hdr) - 2;
 		po->chan.private = sk;
 		po->chan.ops = &pppoe_chan_ops;
-		po->chan.direct_xmit = true;
-		po->chan.xmit_offload = true;
+		po->chan.xmit_flags = PPP_CHANNEL_NO_QDISC | PPP_CHANNEL_SG |
+				      PPP_CHANNEL_OFFLOAD;
 
 		error = ppp_register_net_channel(dev_net(dev), &po->chan);
 		if (error) {

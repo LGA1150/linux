@@ -132,6 +132,23 @@ them until after ppp_unregister_channel() returns.  The ``mtu`` field
 represents the maximum size of the data part of the PPP frames, that
 is, it does not include the 2-byte protocol number.
 
+The channel should also initialize ``xmit_flags`` before registration:
+
+* ``PPP_CHANNEL_NO_QDISC`` (bit 0) makes the attached PPP interface bypass
+  the transmit qdisc.  Channels that need queued transmission should leave
+  this flag clear.
+* ``PPP_CHANNEL_SG`` (bit 1) allows non-linear skbuffs, including page
+  fragments and fragment lists, to reach ``start_xmit()`` without being
+  linearized first.  Software segmentation preserves page fragments for
+  such channels.
+* ``PPP_CHANNEL_OFFLOAD`` (bit 2) allows bridged GSO and
+  ``CHECKSUM_PARTIAL`` packets.  The channel must complete segmentation
+  and checksumming itself, or pass them to a transmit path that does so.
+
+These capabilities are independent.  For example, an async PPP channel
+can handle non-linear packets while still requiring a transmit qdisc,
+software segmentation and completed transport checksums.
+
 If the channel needs some headroom in the skbuffs presented to it for
 transmission (i.e., some space free in the skbuff data area before the
 start of the PPP frame), it should set the ``hdrlen`` field of the
