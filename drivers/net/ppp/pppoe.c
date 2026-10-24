@@ -430,11 +430,18 @@ static void pppoe_unbind_sock_work(struct work_struct *work)
 	struct sock *sk = &po->sk;
 
 	lock_sock(sk);
-	if (po->pppoe_dev) {
-		dev_put(po->pppoe_dev);
-		po->pppoe_dev = NULL;
+	/* A PADT terminates the session it was received for.  If the socket
+	 * has been reconnected to a new session while this work was pending,
+	 * the PADT belongs to the old session and must not tear down the new
+	 * one.
+	 */
+	if (po->proto.pppoe.padt_gen == po->proto.pppoe.session_gen) {
+		if (po->pppoe_dev) {
+			dev_put(po->pppoe_dev);
+			po->pppoe_dev = NULL;
+		}
+		pppox_unbind_sock(sk);
 	}
-	pppox_unbind_sock(sk);
 	release_sock(sk);
 	sock_put(sk);
 }
@@ -469,9 +476,27 @@ static int pppoe_disc_rcv(struct sk_buff *skb, struct net_device *dev,
 
 	pn = pppoe_pernet(dev_net(dev));
 	po = get_item(pn, ph->sid, eth_hdr(skb)->h_source, dev->ifindex);
-	if (po)
-		if (!schedule_work(&po->proto.pppoe.padt_work))
-			sock_put(&po->sk);
+	if (po) {
+		struct sock *sk = &po->sk;
+		bool queue = false;
+
+		/* pppoe_connect() updates the session generation while
+		 * owning the socket, so sample it under the socket lock:
+		 * otherwise a connect() in flight could make the pending work
+		 * terminate the session that replaced the one this PADT
+		 * refers to.  A PADT racing with a re-bind can be ignored,
+		 * that connect() takes the old session down anyway.
+		 */
+		bh_lock_sock(sk);
+		if (!sock_owned_by_user(sk)) {
+			po->proto.pppoe.padt_gen = po->proto.pppoe.session_gen;
+			queue = true;
+		}
+		bh_unlock_sock(sk);
+
+		if (!queue || !schedule_work(&po->proto.pppoe.padt_work))
+			sock_put(sk);
+	}
 
 abort:
 	kfree_skb(skb);
@@ -630,6 +655,7 @@ static int pppoe_connect(struct socket *sock, struct sockaddr_unsized *uservaddr
 		po->num = 0;
 
 		sk->sk_state = PPPOX_NONE;
+		po->proto.pppoe.session_gen++;
 	}
 
 	/* Re-bind in session stage only */
@@ -650,6 +676,11 @@ static int pppoe_connect(struct socket *sock, struct sockaddr_unsized *uservaddr
 		memcpy(&po->pppoe_pa,
 		       &sp->sa_addr.pppoe,
 		       sizeof(struct pppoe_addr));
+
+		/* Both generation updates happen while the socket is owned,
+		 * so pppoe_disc_rcv() never sees a binding in mid-re-bind.
+		 */
+		po->proto.pppoe.session_gen++;
 
 		spin_lock(&pn->hash_lock);
 		error = __set_item(pn, po);

@@ -25,6 +25,9 @@ struct pppoe_opt {
 	struct net_device      *dev;	  /* device associated with socket*/
 	int			ifindex;  /* ifindex of device associated with socket */
 	struct pppoe_addr	pa;	  /* what this socket is bound to*/
+	/* both generations are only touched while holding the socket */
+	unsigned int		session_gen; /* bumped whenever a session is rebound */
+	unsigned int		padt_gen;  /* session_gen in effect when a PADT was seen */
 	struct work_struct      padt_work;/* Work item for handling PADT */
 };
 
