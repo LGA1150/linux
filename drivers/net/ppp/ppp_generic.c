@@ -2591,7 +2591,7 @@ ppp_decompress_frame(struct ppp *ppp, struct sk_buff *skb)
 		skb_pull(skb, 2);	/* pull off the A/C bytes */
 
 		/* Don't call __ppp_decompress_proto() here, but instead rely on
-		 * corresponding algo (mppe/bsd/deflate) to decompress it.
+		 * corresponding algo (mppe/deflate) to decompress it.
 		 */
 	} else {
 		/* Uncompressed frame - pass to decompressor so it

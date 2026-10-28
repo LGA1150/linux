@@ -57,7 +57,6 @@ obj-$(CONFIG_QCOM_IPA) += ipa/
 obj-$(CONFIG_PLIP) += plip/
 obj-$(CONFIG_PPP) += ppp/
 obj-$(CONFIG_PPP_ASYNC) += ppp/
-obj-$(CONFIG_PPP_BSDCOMP) += ppp/
 obj-$(CONFIG_PPP_DEFLATE) += ppp/
 obj-$(CONFIG_PPP_MPPE) += ppp/
 obj-$(CONFIG_PPP_SYNC_TTY) += ppp/

@@ -34,24 +34,6 @@ config PPP
 
 if PPP
 
-config PPP_BSDCOMP
-	tristate "PPP BSD-Compress compression"
-	help
-	  Support for the BSD-Compress compression method for PPP, which uses
-	  the LZW compression method to compress each PPP packet before it is
-	  sent over the wire. The machine at the other end of the PPP link
-	  (usually your ISP) has to support the BSD-Compress compression
-	  method as well for this to be useful. Even if they don't support it,
-	  it is safe to say Y here.
-
-	  The PPP Deflate compression method ("PPP Deflate compression",
-	  above) is preferable to BSD-Compress, because it compresses better
-	  and is patent-free.
-
-	  Note that the BSD compression code will always be compiled as a
-	  module; it is called bsd_comp and will show up in the directory
-	  modules once you have said "make modules". If unsure, say N.
-
 config PPP_DEFLATE
 	tristate "PPP Deflate compression"
 	select ZLIB_INFLATE
