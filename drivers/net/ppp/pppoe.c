@@ -1119,9 +1119,7 @@ static struct sk_buff *pppoe_gro_receive(struct list_head *head,
 	const struct packet_offload *ptype;
 	unsigned int hlen, off_pppoe;
 	const struct pppoe_hdr *phdr;
-	struct sk_buff *pp = NULL;
 	struct sk_buff *p;
-	int flush = 1;
 	__be16 type;
 
 	off_pppoe = skb_gro_offset(skb);
@@ -1143,8 +1141,6 @@ static struct sk_buff *pppoe_gro_receive(struct list_head *head,
 	if (!ptype)
 		goto out;
 
-	flush = 0;
-
 	list_for_each_entry(p, head, list) {
 		const struct pppoe_hdr *phdr2;
 
@@ -1159,14 +1155,14 @@ static struct sk_buff *pppoe_gro_receive(struct list_head *head,
 	skb_gro_pull(skb, PPPOE_SES_HLEN);
 	skb_gro_postpull_rcsum(skb, phdr, PPPOE_SES_HLEN);
 
-	pp = indirect_call_gro_receive_inet(ptype->callbacks.gro_receive,
-					    ipv6_gro_receive, inet_gro_receive,
-					    head, skb);
+	return indirect_call_gro_receive_inet(ptype->callbacks.gro_receive,
+					      ipv6_gro_receive, inet_gro_receive,
+					      head, skb);
 
 out:
-	skb_gro_flush_final(skb, pp, flush);
+	NAPI_GRO_CB(skb)->flush = 1;
 
-	return pp;
+	return NULL;
 }
 
 static int pppoe_gro_complete(struct sk_buff *skb, int nhoff)

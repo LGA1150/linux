@@ -1469,7 +1469,6 @@ static struct sk_buff *ipip_gso_segment(struct sk_buff *skb,
 struct sk_buff *inet_gro_receive(struct list_head *head, struct sk_buff *skb)
 {
 	const struct net_offload *ops;
-	struct sk_buff *pp = NULL;
 	const struct iphdr *iph;
 	struct sk_buff *p;
 	unsigned int hlen;
@@ -1530,13 +1529,13 @@ struct sk_buff *inet_gro_receive(struct list_head *head, struct sk_buff *skb)
 	skb_gro_pull(skb, sizeof(*iph));
 	skb_set_transport_header(skb, skb_gro_offset(skb));
 
-	pp = indirect_call_gro_receive(tcp4_gro_receive, udp4_gro_receive,
-				       ops->callbacks.gro_receive, head, skb);
+	return indirect_call_gro_receive(tcp4_gro_receive, udp4_gro_receive,
+					 ops->callbacks.gro_receive, head, skb);
 
 out:
-	skb_gro_flush_final(skb, pp, flush);
+	NAPI_GRO_CB(skb)->flush |= flush;
 
-	return pp;
+	return NULL;
 }
 EXPORT_INDIRECT_CALLABLE(inet_gro_receive);
 

@@ -208,7 +208,6 @@ INDIRECT_CALLABLE_SCOPE struct sk_buff *ipv6_gro_receive(struct list_head *head,
 							 struct sk_buff *skb)
 {
 	const struct net_offload *ops;
-	struct sk_buff *pp = NULL;
 	struct sk_buff *p;
 	struct ipv6hdr *iph;
 	unsigned int nlen;
@@ -289,17 +288,16 @@ not_same_flow:
 	}
 
 	if (likely(proto == IPPROTO_TCP))
-		pp = tcp6_gro_receive(head, skb);
+		return tcp6_gro_receive(head, skb);
 #if IS_ENABLED(CONFIG_IPV6)
-	else if (likely(proto == IPPROTO_UDP))
-		pp = udp6_gro_receive(head, skb);
+	if (likely(proto == IPPROTO_UDP))
+		return udp6_gro_receive(head, skb);
 #endif
-	else
-		pp = ops->callbacks.gro_receive(head, skb);
+	return ops->callbacks.gro_receive(head, skb);
 out:
-	skb_gro_flush_final(skb, pp, flush);
+	NAPI_GRO_CB(skb)->flush |= flush;
 
-	return pp;
+	return NULL;
 }
 EXPORT_INDIRECT_CALLABLE(ipv6_gro_receive);
 

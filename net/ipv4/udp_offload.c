@@ -776,12 +776,10 @@ static struct sk_buff *udp_gro_receive_segment(struct list_head *head,
 struct sk_buff *udp_gro_receive(struct list_head *head, struct sk_buff *skb,
 				struct udphdr *uh, struct sock *sk)
 {
-	struct sk_buff *pp = NULL;
 	struct sk_buff *p;
 	struct udphdr *uh2;
 	unsigned int off = skb_gro_offset(skb);
 	unsigned int ulen;
-	int flush = 1;
 
 	/* Do not deal with padded or malicious packets, sorry! */
 	ulen = udp_get_len_short(uh);
@@ -821,8 +819,6 @@ struct sk_buff *udp_gro_receive(struct list_head *head, struct sk_buff *skb,
 	/* mark that this skb passed once through the tunnel gro layer */
 	NAPI_GRO_CB(skb)->encap_mark = 1;
 
-	flush = 0;
-
 	list_for_each_entry(p, head, list) {
 		if (!NAPI_GRO_CB(p)->same_flow)
 			continue;
@@ -841,11 +837,11 @@ struct sk_buff *udp_gro_receive(struct list_head *head, struct sk_buff *skb,
 
 	skb_gro_pull(skb, sizeof(struct udphdr)); /* pull encapsulating udp header */
 	skb_gro_postpull_rcsum(skb, uh, sizeof(struct udphdr));
-	pp = udp_tunnel_gro_rcv(sk, head, skb);
+	return udp_tunnel_gro_rcv(sk, head, skb);
 
 out:
-	skb_gro_flush_final(skb, pp, flush);
-	return pp;
+	NAPI_GRO_CB(skb)->flush = 1;
+	return NULL;
 }
 
 static struct sock *udp4_gro_lookup_skb(struct sk_buff *skb, __be16 sport,
@@ -871,7 +867,6 @@ struct sk_buff *udp4_gro_receive(struct list_head *head, struct sk_buff *skb)
 {
 	struct udphdr *uh = udp_gro_udphdr(skb);
 	struct sock *sk = NULL;
-	struct sk_buff *pp;
 
 	if (unlikely(!uh))
 		goto flush;
@@ -890,8 +885,7 @@ skip:
 	if (static_branch_unlikely(&udp_encap_needed_key))
 		sk = udp4_gro_lookup_skb(skb, uh->source, uh->dest);
 
-	pp = udp_gro_receive(head, skb, uh, sk);
-	return pp;
+	return udp_gro_receive(head, skb, uh, sk);
 
 flush:
 	NAPI_GRO_CB(skb)->flush = 1;

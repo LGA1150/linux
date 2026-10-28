@@ -718,13 +718,12 @@ static struct sk_buff *vxlan_gro_receive(struct sock *sk,
 {
 	struct sk_buff *pp = NULL;
 	struct gro_remcsum grc;
-	int flush = 1;
 
-	if (vxlan_gro_prepare_receive(sk, head, skb, &grc)) {
+	if (vxlan_gro_prepare_receive(sk, head, skb, &grc))
 		pp = call_gro_receive(eth_gro_receive, head, skb);
-		flush = 0;
-	}
-	skb_gro_flush_final_remcsum(skb, pp, flush, &grc);
+	else
+		NAPI_GRO_CB(skb)->flush = 1;
+	skb_gro_remcsum_finish(skb, pp, &grc);
 	return pp;
 }
 
@@ -737,20 +736,21 @@ static struct sk_buff *vxlan_gpe_gro_receive(struct sock *sk,
 	struct gro_remcsum grc;
 	struct vxlanhdr *vh;
 	__be16 protocol;
-	int flush = 1;
 
 	vh = vxlan_gro_prepare_receive(sk, head, skb, &grc);
 	if (vh) {
 		if (!vxlan_parse_gpe_proto(vh, &protocol))
-			goto out;
+			goto flush;
 		ptype = gro_find_receive_by_type(protocol);
 		if (!ptype)
-			goto out;
+			goto flush;
 		pp = call_gro_receive(ptype->callbacks.gro_receive, head, skb);
-		flush = 0;
+		goto out;
 	}
+flush:
+	NAPI_GRO_CB(skb)->flush = 1;
 out:
-	skb_gro_flush_final_remcsum(skb, pp, flush, &grc);
+	skb_gro_remcsum_finish(skb, pp, &grc);
 	return pp;
 }
 

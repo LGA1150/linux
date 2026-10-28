@@ -122,12 +122,10 @@ out:
 static struct sk_buff *gre_gro_receive(struct list_head *head,
 				       struct sk_buff *skb)
 {
-	struct sk_buff *pp = NULL;
 	struct sk_buff *p;
 	const struct gre_base_hdr *greh;
 	unsigned int hlen, grehlen;
 	unsigned int off;
-	int flush = 1;
 	struct packet_offload *ptype;
 	__be16 type;
 
@@ -224,13 +222,12 @@ static struct sk_buff *gre_gro_receive(struct list_head *head,
 	/* Adjusted NAPI_GRO_CB(skb)->csum after skb_gro_pull()*/
 	skb_gro_postpull_rcsum(skb, greh, grehlen);
 
-	pp = call_gro_receive(ptype->callbacks.gro_receive, head, skb);
-	flush = 0;
+	return call_gro_receive(ptype->callbacks.gro_receive, head, skb);
 
 out:
-	skb_gro_flush_final(skb, pp, flush);
+	NAPI_GRO_CB(skb)->flush = 1;
 
-	return pp;
+	return NULL;
 }
 
 static int gre_gro_complete(struct sk_buff *skb, int nhoff)

@@ -466,11 +466,9 @@ static struct sk_buff *vlan_gro_receive(struct list_head *head,
 {
 	const struct packet_offload *ptype;
 	unsigned int hlen, off_vlan;
-	struct sk_buff *pp = NULL;
 	struct vlan_hdr *vhdr;
 	struct sk_buff *p;
 	__be16 type;
-	int flush = 1;
 
 	off_vlan = skb_gro_offset(skb);
 	hlen = off_vlan + sizeof(*vhdr);
@@ -486,8 +484,6 @@ static struct sk_buff *vlan_gro_receive(struct list_head *head,
 	if (!ptype)
 		goto out;
 
-	flush = 0;
-
 	list_for_each_entry(p, head, list) {
 		struct vlan_hdr *vhdr2;
 
@@ -502,14 +498,14 @@ static struct sk_buff *vlan_gro_receive(struct list_head *head,
 	skb_gro_pull(skb, sizeof(*vhdr));
 	skb_gro_postpull_rcsum(skb, vhdr, sizeof(*vhdr));
 
-	pp = indirect_call_gro_receive_inet(ptype->callbacks.gro_receive,
-					    ipv6_gro_receive, inet_gro_receive,
-					    head, skb);
+	return indirect_call_gro_receive_inet(ptype->callbacks.gro_receive,
+					      ipv6_gro_receive, inet_gro_receive,
+					      head, skb);
 
 out:
-	skb_gro_flush_final(skb, pp, flush);
+	NAPI_GRO_CB(skb)->flush = 1;
 
-	return pp;
+	return NULL;
 }
 
 static int vlan_gro_complete(struct sk_buff *skb, int nhoff)

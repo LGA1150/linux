@@ -898,9 +898,7 @@ static struct sk_buff *geneve_gro_receive(struct sock *sk,
 	const struct geneve_opt_gro_hint *gro_hint;
 	const struct packet_offload *ptype;
 	struct genevehdr *gh, *gh2;
-	struct sk_buff *pp = NULL;
 	struct sk_buff *p;
-	int flush = 1;
 	__be16 type;
 
 	off_gnv = skb_gro_offset(skb);
@@ -959,13 +957,12 @@ static struct sk_buff *geneve_gro_receive(struct sock *sk,
 	if (!ptype)
 		goto out;
 
-	pp = call_gro_receive(ptype->callbacks.gro_receive, head, skb);
-	flush = 0;
+	return call_gro_receive(ptype->callbacks.gro_receive, head, skb);
 
 out:
-	skb_gro_flush_final(skb, pp, flush);
+	NAPI_GRO_CB(skb)->flush = 1;
 
-	return pp;
+	return NULL;
 }
 
 static int geneve_gro_complete(struct sock *sk, struct sk_buff *skb,

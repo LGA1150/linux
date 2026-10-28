@@ -135,7 +135,6 @@ struct sk_buff *udp6_gro_receive(struct list_head *head, struct sk_buff *skb)
 {
 	struct udphdr *uh = udp_gro_udphdr(skb);
 	struct sock *sk = NULL;
-	struct sk_buff *pp;
 
 	if (unlikely(!uh))
 		goto flush;
@@ -155,8 +154,7 @@ skip:
 	if (static_branch_unlikely(&udpv6_encap_needed_key))
 		sk = udp6_gro_lookup_skb(skb, uh->source, uh->dest);
 
-	pp = udp_gro_receive(head, skb, uh, sk);
-	return pp;
+	return udp_gro_receive(head, skb, uh, sk);
 
 flush:
 	NAPI_GRO_CB(skb)->flush = 1;

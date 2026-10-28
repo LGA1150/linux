@@ -377,19 +377,15 @@ struct sk_buff *eth_gro_receive(struct list_head *head, struct sk_buff *skb)
 {
 	const struct packet_offload *ptype;
 	unsigned int hlen, off_eth;
-	struct sk_buff *pp = NULL;
 	struct ethhdr *eh, *eh2;
 	struct sk_buff *p;
 	__be16 type;
-	int flush = 1;
 
 	off_eth = skb_gro_offset(skb);
 	hlen = off_eth + sizeof(*eh);
 	eh = skb_gro_header(skb, hlen, off_eth);
 	if (unlikely(!eh))
 		goto out;
-
-	flush = 0;
 
 	list_for_each_entry(p, head, list) {
 		if (!NAPI_GRO_CB(p)->same_flow)
@@ -405,22 +401,20 @@ struct sk_buff *eth_gro_receive(struct list_head *head, struct sk_buff *skb)
 	type = eh->h_proto;
 
 	ptype = gro_find_receive_by_type(type);
-	if (ptype == NULL) {
-		flush = 1;
+	if (!ptype)
 		goto out;
-	}
 
 	skb_gro_pull(skb, sizeof(*eh));
 	skb_gro_postpull_rcsum(skb, eh, sizeof(*eh));
 
-	pp = indirect_call_gro_receive_inet(ptype->callbacks.gro_receive,
-					    ipv6_gro_receive, inet_gro_receive,
-					    head, skb);
+	return indirect_call_gro_receive_inet(ptype->callbacks.gro_receive,
+					      ipv6_gro_receive, inet_gro_receive,
+					      head, skb);
 
 out:
-	skb_gro_flush_final(skb, pp, flush);
+	NAPI_GRO_CB(skb)->flush = 1;
 
-	return pp;
+	return NULL;
 }
 EXPORT_SYMBOL(eth_gro_receive);
 

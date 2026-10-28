@@ -247,7 +247,6 @@ static struct sk_buff *fou_gro_receive(struct sock *sk,
 {
 	struct fou *fou = fou_from_sock(sk);
 	const struct net_offload *ops;
-	struct sk_buff *pp = NULL;
 
 	if (!fou)
 		goto out;
@@ -267,10 +266,10 @@ static struct sk_buff *fou_gro_receive(struct sock *sk,
 	if (!ops || !ops->callbacks.gro_receive)
 		goto out;
 
-	pp = call_gro_receive(ops->callbacks.gro_receive, head, skb);
+	return call_gro_receive(ops->callbacks.gro_receive, head, skb);
 
 out:
-	return pp;
+	return NULL;
 }
 
 static int fou_gro_complete(struct sock *sk, struct sk_buff *skb,
@@ -333,7 +332,6 @@ static struct sk_buff *gue_gro_receive(struct sock *sk,
 	size_t len, optlen, hdrlen, off;
 	void *data;
 	u16 doffset = 0;
-	int flush = 1;
 	struct fou *fou = fou_from_sock(sk);
 	struct gro_remcsum grc;
 	u8 proto;
@@ -341,14 +339,14 @@ static struct sk_buff *gue_gro_receive(struct sock *sk,
 	skb_gro_remcsum_init(&grc);
 
 	if (!fou)
-		goto out;
+		goto flush;
 
 	off = skb_gro_offset(skb);
 	len = off + sizeof(*guehdr);
 
 	guehdr = skb_gro_header(skb, len, off);
 	if (unlikely(!guehdr))
-		goto out;
+		goto flush;
 
 	switch (guehdr->version) {
 	case 0:
@@ -362,11 +360,11 @@ static struct sk_buff *gue_gro_receive(struct sock *sk,
 			proto = IPPROTO_IPV6;
 			break;
 		default:
-			goto out;
+			goto flush;
 		}
 		goto next_proto;
 	default:
-		goto out;
+		goto flush;
 	}
 
 	optlen = guehdr->hlen << 2;
@@ -375,12 +373,12 @@ static struct sk_buff *gue_gro_receive(struct sock *sk,
 	if (!skb_gro_may_pull(skb, len)) {
 		guehdr = skb_gro_header_slow(skb, len, off);
 		if (unlikely(!guehdr))
-			goto out;
+			goto flush;
 	}
 
 	if (unlikely(guehdr->control) || guehdr->version != 0 ||
 	    validate_gue_flags(guehdr, optlen))
-		goto out;
+		goto flush;
 
 	hdrlen = sizeof(*guehdr) + optlen;
 
@@ -403,7 +401,7 @@ static struct sk_buff *gue_gro_receive(struct sock *sk,
 						    FOU_F_REMCSUM_NOPARTIAL));
 
 			if (!guehdr)
-				goto out;
+				goto flush;
 
 			data = &guehdr[1];
 
@@ -454,13 +452,15 @@ next_proto:
 
 	ops = fou_gro_ops(sk, proto);
 	if (!ops || !ops->callbacks.gro_receive)
-		goto out;
+		goto flush;
 
 	pp = call_gro_receive(ops->callbacks.gro_receive, head, skb);
-	flush = 0;
+	goto out;
 
+flush:
+	NAPI_GRO_CB(skb)->flush = 1;
 out:
-	skb_gro_flush_final_remcsum(skb, pp, flush, &grc);
+	skb_gro_remcsum_finish(skb, pp, &grc);
 
 	return pp;
 }
