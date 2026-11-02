@@ -962,8 +962,13 @@ static int pppoe_seq_show(struct seq_file *seq, void *v)
 	po = v;
 	dev_name = po->pppoe_pa.dev;
 
+	/*
+	 * Preserve the historical ABI: the network-order session ID is printed
+	 * as a host integer. Userspace tools compensate for the swapped bytes
+	 * on little-endian systems.
+	 */
 	seq_printf(seq, "%08X %pM %8s\n",
-		po->pppoe_pa.sid, po->pppoe_pa.remote, dev_name);
+		(__force u16)po->pppoe_pa.sid, po->pppoe_pa.remote, dev_name);
 out:
 	return 0;
 }
