@@ -4252,7 +4252,9 @@ static void tcp_connect_queue_skb(struct sock *sk, struct sk_buff *skb)
 
 	tcb->end_seq += skb->len;
 	__skb_header_release(skb);
-	sk_wmem_queued_add(sk, skb->truesize);
+	/* Paired with smp_load_acquire() in tcp_diag_get_info(). */
+	smp_store_release(&sk->sk_wmem_queued,
+			  sk->sk_wmem_queued + skb->truesize);
 	sk_mem_charge(sk, skb->truesize);
 	WRITE_ONCE(tp->write_seq, tcb->end_seq);
 	tp->packets_out += tcp_skb_pcount(skb);

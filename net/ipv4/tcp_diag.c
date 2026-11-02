@@ -31,7 +31,10 @@ static void tcp_diag_get_info(struct sock *sk, struct inet_diag_msg *r,
 
 		r->idiag_rqueue = max_t(int, READ_ONCE(tp->rcv_nxt) -
 					     READ_ONCE(tp->copied_seq), 0);
-		r->idiag_wqueue = READ_ONCE(tp->write_seq) - tp->snd_una;
+		/* Paired with smp_store_release() in tcp_connect_queue_skb(). */
+		r->idiag_wqueue = smp_load_acquire(&sk->sk_wmem_queued) ?
+				  READ_ONCE(tp->write_seq) -
+				  READ_ONCE(tp->snd_una) : 0;
 	}
 	if (info)
 		tcp_get_info(sk, info);
