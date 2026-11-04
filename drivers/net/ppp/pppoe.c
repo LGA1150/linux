@@ -254,33 +254,35 @@ static void pppoe_flush_dev(struct net_device *dev)
 	int i;
 
 	pn = pppoe_pernet(dev_net(dev));
-	spin_lock(&pn->hash_lock);
+	/* Pair with the barrier in pppoe_connect() so a new socket either
+	 * observes the updated MTU or is found by this scan.
+	 */
+	smp_mb();
+	rcu_read_lock();
 	for (i = 0; i < PPPOE_HASH_SIZE; i++) {
-		struct pppox_sock *po = rcu_dereference_protected(pn->hash_table[i],
-								  lockdep_is_held(&pn->hash_lock));
+		struct pppox_sock *po = rcu_dereference(pn->hash_table[i]);
 		struct sock *sk;
 
 		while (po) {
-			while (po && po->pppoe_dev != dev) {
-				po = rcu_dereference_protected(po->next,
-							       lockdep_is_held(&pn->hash_lock));
-			}
+			while (po && po->pppoe_dev != dev)
+				po = rcu_dereference(po->next);
 
 			if (!po)
 				break;
 
 			sk = &po->sk;
 
-			/* We always grab the socket lock, followed by the
-			 * hash_lock, in that order.  Since we should hold the
-			 * sock lock while doing any unbinding, we need to
-			 * release the lock we're holding.  Hold a reference to
-			 * the sock so it doesn't disappear as we're jumping
-			 * between locks.
+			/* Since we should hold the sock lock while doing any
+			 * unbinding, which may sleep, we need to release the
+			 * RCU we're holding.  Hold a reference to the sock so
+			 * it doesn't disappear as we're jumping between locks.
 			 */
 
-			sock_hold(sk);
-			spin_unlock(&pn->hash_lock);
+			if (!refcount_inc_not_zero(&sk->sk_refcnt)) {
+				po = rcu_dereference(po->next);
+				continue;
+			}
+			rcu_read_unlock();
 			lock_sock(sk);
 
 			if (po->pppoe_dev == dev &&
@@ -300,12 +302,11 @@ static void pppoe_flush_dev(struct net_device *dev)
 			 */
 
 			BUG_ON(pppoe_pernet(dev_net(dev)) == NULL);
-			spin_lock(&pn->hash_lock);
-			po = rcu_dereference_protected(pn->hash_table[i],
-						       lockdep_is_held(&pn->hash_lock));
+			rcu_read_lock();
+			po = rcu_dereference(pn->hash_table[i]);
 		}
 	}
-	spin_unlock(&pn->hash_lock);
+	rcu_read_unlock();
 }
 
 static int pppoe_device_event(struct notifier_block *this,
@@ -664,6 +665,10 @@ static int pppoe_connect(struct socket *sock, struct sockaddr_unsized *uservaddr
 		if (error < 0)
 			goto err_put;
 
+		/* Pair with the barrier in pppoe_flush_dev() to order hash
+		 * insertion before reading the device MTU.
+		 */
+		smp_mb();
 		po->chan.hdrlen = (sizeof(struct pppoe_hdr) +
 				   dev->hard_header_len);
 
