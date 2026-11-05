@@ -4,6 +4,7 @@
 #include <linux/module.h>
 #include <linux/types.h>
 #include <linux/if_vlan.h>
+#include <linux/if_pppox.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
 #include <linux/ip.h>
@@ -1476,6 +1477,8 @@ static int igc_tso(struct igc_ring *tx_ring,
 		return err;
 
 	ip.hdr = skb_network_header(skb);
+	if (skb_shinfo(skb)->gso_type & SKB_GSO_PPPOE)
+		ip.hdr += PPPOE_SES_HLEN;
 	l4.hdr = skb_checksum_start(skb);
 
 	/* ADV DTYP TUCMD MKRLOC/ISCSIHEDLEN */
@@ -5542,6 +5545,26 @@ igc_features_check(struct sk_buff *skb, struct net_device *dev,
 
 	/* Make certain the headers can be described by a context descriptor */
 	mac_hdr_len = skb_network_offset(skb);
+	if (skb_is_gso(skb) &&
+	    (skb_shinfo(skb)->gso_type & SKB_GSO_PPPOE)) {
+		int offset = skb_checksum_start_offset(skb);
+		struct tcphdr _tcph, *th;
+
+		/* Only TCP directly inside PPPoE can use the single IP context. */
+		if (skb->encapsulation ||
+		    (skb_shinfo(skb)->gso_type &
+		     ~(SKB_GSO_TCPV4 | SKB_GSO_TCPV6 | SKB_GSO_DODGY |
+		       SKB_GSO_TCP_ECN | SKB_GSO_TCP_FIXEDID |
+		       SKB_GSO_PARTIAL | SKB_GSO_PPPOE)))
+			return features & ~NETIF_F_GSO_MASK;
+		mac_hdr_len += PPPOE_SES_HLEN;
+		if (offset < 0 || offset < mac_hdr_len)
+			return features & ~NETIF_F_GSO_MASK;
+		th = skb_header_pointer(skb, offset, sizeof(_tcph), &_tcph);
+		/* igc_tso() and igc_tx_map() use an eight-bit header length. */
+		if (!th || offset + __tcp_hdrlen(th) > U8_MAX)
+			return features & ~NETIF_F_GSO_MASK;
+	}
 	if (unlikely(mac_hdr_len > IGC_MAX_MAC_HDR_LEN))
 		return features & ~(NETIF_F_HW_CSUM |
 				    NETIF_F_SCTP_CRC |
@@ -5549,7 +5572,7 @@ igc_features_check(struct sk_buff *skb, struct net_device *dev,
 				    NETIF_F_TSO |
 				    NETIF_F_TSO6);
 
-	network_hdr_len = skb_checksum_start(skb) - skb_network_header(skb);
+	network_hdr_len = skb_checksum_start_offset(skb) - mac_hdr_len;
 	if (unlikely(network_hdr_len >  IGC_MAX_NETWORK_HDR_LEN))
 		return features & ~(NETIF_F_HW_CSUM |
 				    NETIF_F_SCTP_CRC |
@@ -7223,7 +7246,8 @@ static int igc_probe(struct pci_dev *pdev,
 				  NETIF_F_GSO_IPXIP4 | \
 				  NETIF_F_GSO_IPXIP6 | \
 				  NETIF_F_GSO_UDP_TUNNEL | \
-				  NETIF_F_GSO_UDP_TUNNEL_CSUM)
+				  NETIF_F_GSO_UDP_TUNNEL_CSUM | \
+				  NETIF_F_GSO_PPPOE)
 
 	netdev->gso_partial_features = IGC_GSO_PARTIAL_FEATURES;
 	netdev->features |= NETIF_F_GSO_PARTIAL | IGC_GSO_PARTIAL_FEATURES;
