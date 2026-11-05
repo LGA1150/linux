@@ -1635,7 +1635,7 @@ static void ppp_setup(struct net_device *dev)
 	dev->flags = IFF_POINTOPOINT | IFF_NOARP | IFF_MULTICAST;
 	dev->priv_destructor = ppp_dev_priv_destructor;
 	dev->pcpu_stat_type = NETDEV_PCPU_STAT_TSTATS;
-	dev->features = NETIF_F_SG | NETIF_F_FRAGLIST;
+	dev->features = NETIF_F_SG | NETIF_F_FRAGLIST | NETIF_F_HW_CSUM;
 	dev->hw_features = dev->features;
 	netif_keep_dst(dev);
 }
@@ -1643,6 +1643,22 @@ static void ppp_setup(struct net_device *dev)
 /*
  * Transmit-side routines.
  */
+
+static int ppp_skb_checksum_help(struct sk_buff *skb)
+{
+	if (skb->ip_summed == CHECKSUM_PARTIAL)
+		return skb_csum_hwoffload_help(skb, 0);
+	return 0;
+}
+
+static int ppp_prepare_channel_skb(struct ppp_channel *chan, struct sk_buff *skb)
+{
+	if (!chan->direct_xmit && skb_linearize(skb))
+		return -ENOMEM;
+	if (!chan->xmit_offload)
+		return ppp_skb_checksum_help(skb);
+	return 0;
+}
 
 /* Called to do any work queued up on the transmit side that can now be done */
 static void ppp_xmit_flush(struct ppp *ppp)
@@ -1726,7 +1742,8 @@ pad_compress_skb(struct ppp *ppp, struct sk_buff *skb)
 	int compressor_skb_size = dev->mtu +
 		ppp->xcomp->comp_extra + PPP_HDRLEN;
 
-	if (skb_linearize(skb))
+	/* Compression consumes packet bytes and cannot preserve checksum metadata. */
+	if (ppp_skb_checksum_help(skb) || skb_linearize(skb))
 		return NULL;
 
 	new_skb = alloc_skb(new_skb_size, GFP_ATOMIC);
@@ -1819,7 +1836,7 @@ ppp_prepare_tx_skb(struct ppp *ppp, struct sk_buff **pskb)
 		if (!ppp->vj || (ppp->flags & SC_COMP_TCP) == 0)
 			break;
 
-		if (skb_linearize(skb))
+		if (ppp_skb_checksum_help(skb) || skb_linearize(skb))
 			goto drop;
 
 		/* try to do VJ TCP header compression */
@@ -1882,7 +1899,7 @@ ppp_prepare_tx_skb(struct ppp *ppp, struct sk_buff **pskb)
 	 * queue it up for pppd to receive.
 	 */
 	if (ppp->flags & SC_LOOP_TRAFFIC) {
-		if (ppp->file.rq.qlen > PPP_MAX_RQLEN)
+		if (ppp->file.rq.qlen > PPP_MAX_RQLEN || ppp_skb_checksum_help(skb))
 			goto drop;
 		skb_queue_tail(&ppp->file.rq, skb);
 		wake_up_interruptible(&ppp->file.rwait);
@@ -1924,10 +1941,7 @@ ppp_push(struct ppp *ppp, struct sk_buff *skb)
 
 		spin_lock(&pch->downl);
 		chan = pch->chan;
-		if (unlikely(!chan->direct_xmit && skb_linearize(skb))) {
-			/* channel requires a linear skb but linearization
-			 * failed
-			 */
+		if (unlikely(ppp_prepare_channel_skb(chan, skb))) {
 			kfree_skb(skb);
 			ret = 1;
 			goto out;
@@ -2015,9 +2029,10 @@ static int ppp_mp_explode(struct ppp *ppp, struct sk_buff *skb)
 	if (nfree == 0 || nfree < navail / 2)
 		return 0; /* can't take now, leave it in transmit queue */
 
-	/* Do protocol field compression */
-	if (skb_linearize(skb))
+	/* Complete the checksum before copying bytes into multilink fragments. */
+	if (ppp_skb_checksum_help(skb) || skb_linearize(skb))
 		goto err_linearize;
+	/* Do protocol field compression */
 	p = skb->data;
 	len = skb->len;
 	if (*p == 0 && mp_protocol_compress) {
@@ -2333,11 +2348,7 @@ drop:
 
 static void ppp_bridge_xmit(struct ppp_channel *chan, struct sk_buff *skb)
 {
-	if (!chan->direct_xmit && skb_linearize(skb))
-		goto drop;
-
-	if (!chan->xmit_offload && skb->ip_summed == CHECKSUM_PARTIAL &&
-	    skb_csum_hwoffload_help(skb, 0))
+	if (ppp_prepare_channel_skb(chan, skb))
 		goto drop;
 
 	if (chan->ops->start_xmit(chan, skb))

@@ -145,6 +145,26 @@ headroom in the skbuffs presented to ppp_input().  The generic PPP
 code does not require this but will be more efficient if this is done.
 
 
+Checksum offload
+----------------
+
+PPP network interfaces advertise ``NETIF_F_HW_CSUM`` so that transport
+checksums can remain incomplete until the packet reaches the underlying
+network device. A channel sets ``ppp_channel.xmit_offload`` before
+registration if its transmit path accepts GSO and ``CHECKSUM_PARTIAL``
+packets. Such a channel must preserve the checksum metadata and arrange
+for checksum completion, either by an underlying device or in software.
+PPPoE does this through the underlying Ethernet device's transmit path.
+Segmentation requests on the PPP interface are handled by the network
+stack before entering its transmit path.
+
+For channels without ``xmit_offload``, the generic PPP layer completes
+partial checksums in software before calling ``start_xmit()``. It also
+completes checksums before TCP header compression, packet compression or
+encryption, multilink fragmentation, and delivery to userspace for demand
+dialling. These paths consume or copy packet bytes without retaining the
+original checksum metadata.
+
 Buffering and flow control
 --------------------------
 
