@@ -137,6 +137,21 @@ whatever headers there might be.
 NETIF_F_TSO_ECN means that hardware can properly split packets with CWR bit
 set, be it TCPv4 (when NETIF_F_TSO is enabled) or TCPv6 (NETIF_F_TSO6).
 
+ * PPPoE segmentation offload
+
+NETIF_F_GSO_PPPOE is required in addition to the transport segmentation
+features for PPPoE session packets. Drivers which can copy a prepared
+PPPoE header while segmenting the encapsulated TCP packet can include this
+feature in netdev->gso_partial_features. This forces software preparation
+before hardware segmentation, including for packets forwarded after GRO.
+Devices without this feature receive fully segmented PPPoE packets.
+
+With partial GSO, software separates any short final segment and sets the
+PPPoE length in a retained GSO skb to the length of one wire segment. The
+network header still points to PPPoE; drivers must locate the encapsulated
+IP header after the PPPoE header and the two-byte PPP protocol. The PPPoE
+length must be copied unchanged when hardware segments the prepared skb.
+
  * Transmit UDP segmentation offload
 
 NETIF_F_GSO_UDP_L4 accepts a single UDP header with a payload that exceeds

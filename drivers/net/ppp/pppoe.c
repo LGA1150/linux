@@ -396,6 +396,8 @@ static int pppoe_rcv(struct sk_buff *skb, struct net_device *dev,
 	len = ntohs(ph->length);
 
 	skb_pull_rcsum(skb, sizeof(*ph));
+	if (skb_is_gso(skb))
+		skb_shinfo(skb)->gso_type &= ~SKB_GSO_PPPOE;
 	if (skb->len < len)
 		goto drop;
 
@@ -880,6 +882,13 @@ static int pppoe_xmit(struct ppp_channel *chan, struct sk_buff *skb)
 	ph->code = 0;
 	ph->sid	= po->num;
 	ph->length = htons(data_len);
+	if (skb_is_gso(skb)) {
+		/* A new PPPoE header needs preparation even if the incoming
+		 * skb was already partially segmented for another channel.
+		 */
+		skb_shinfo(skb)->gso_type &= ~SKB_GSO_PARTIAL;
+		skb_shinfo(skb)->gso_type |= SKB_GSO_PPPOE;
+	}
 
 	skb->protocol = cpu_to_be16(ETH_P_PPP_SES);
 	skb->dev = dev;
@@ -1192,6 +1201,8 @@ static int pppoe_gro_complete(struct sk_buff *skb, int nhoff)
 	len = min(len, 0xFFFFU);
 	phdr->length = cpu_to_be16(len);
 
+	skb_shinfo(skb)->gso_type |= SKB_GSO_PPPOE;
+
 	return INDIRECT_CALL_INET(ptype->callbacks.gro_complete,
 				  ipv6_gro_complete, inet_gro_complete,
 				  skb, nhoff + PPPOE_SES_HLEN);
@@ -1228,7 +1239,13 @@ static struct sk_buff *pppoe_gso_segment(struct sk_buff *skb,
 	skb = segs;
 	do {
 		phdr = (struct pppoe_hdr *)(skb_mac_header(skb) + nhoff);
-		len = skb->len - (nhoff + sizeof(*phdr));
+		if (skb_is_gso(skb) &&
+		    (skb_shinfo(skb)->gso_type & SKB_GSO_PARTIAL))
+			len = skb_shinfo(skb)->gso_size +
+			      SKB_GSO_CB(skb)->data_offset + skb->head -
+			      (u8 *)(phdr + 1);
+		else
+			len = skb->len - (nhoff + sizeof(*phdr));
 		phdr->length = cpu_to_be16(len);
 		skb->network_header = (u8 *)phdr - skb->head;
 		skb->protocol = orig_type;

@@ -126,6 +126,7 @@
 #include <linux/ctype.h>
 #include <linux/if_arp.h>
 #include <linux/if_vlan.h>
+#include <linux/if_pppox.h>
 #include <linux/ip.h>
 #include <net/ip.h>
 #include <net/mpls.h>
@@ -3958,6 +3959,11 @@ static netdev_features_t gso_features_check(const struct sk_buff *skb,
 			    skb_inner_network_offset(skb) :
 			    skb_network_offset(skb);
 
+		if (!skb->encapsulation &&
+		    (skb_shinfo(skb)->gso_type & SKB_GSO_PPPOE)) {
+			__vlan_get_protocol(skb, skb->protocol, &nhoff);
+			nhoff += PPPOE_SES_HLEN;
+		}
 		iph = skb_header_pointer(skb, nhoff, sizeof(_iph), &_iph);
 
 		if (!iph || !(iph->frag_off & htons(IP_DF)))
@@ -3980,9 +3986,15 @@ __netif_skb_features(struct sk_buff *skb, bool check_gso_limits)
 	struct net_device *dev = skb->dev;
 	netdev_features_t features = dev->features;
 
-	if (skb_is_gso(skb))
+	if (skb_is_gso(skb)) {
+		/* Raw packet/vnet headers cannot describe PPPoE GSO. Include
+		 * the link-layer encapsulation in the offload requirements.
+		 */
+		if (vlan_get_protocol(skb) == htons(ETH_P_PPP_SES))
+			skb_shinfo(skb)->gso_type |= SKB_GSO_PPPOE;
 		features = gso_features_check(skb, dev, features,
 					      check_gso_limits);
+	}
 
 	/* If encapsulation offload request, verify we are testing
 	 * hardware encapsulation features instead of standard

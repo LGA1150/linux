@@ -171,6 +171,14 @@ is the outer IPv4 ID field.  It is up to the device drivers to guarantee
 that the IPv4 ID field is incremented in the case that a given header does
 not have the DF bit set.
 
+PPPoE uses SKB_GSO_PPPOE together with the encapsulated transport GSO type.
+Devices can advertise NETIF_F_GSO_PPPOE in gso_partial_features to segment
+TCP over PPPoE without updating the PPPoE length in hardware. Software
+splits off a short final segment and fills the PPPoE length for one
+full-sized segment in each remaining GSO skb. Hardware then copies that
+PPPoE header into every segment and updates the encapsulated IP/TCP headers.
+The skb network header continues to identify the PPPoE header, not IP.
+
 
 ESP Segmentation Offload
 ========================

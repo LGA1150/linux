@@ -714,6 +714,8 @@ enum {
 
 	SKB_GSO_TCP_ACCECN = 1 << 19,
 
+	SKB_GSO_PPPOE = 1 << 20,
+
 	/* These indirectly map onto the same netdev feature.
 	 * If NETIF_F_TSO_MANGLEID is set it may mangle both inner and outer IDs.
 	 */
