@@ -21,6 +21,10 @@ log.txt
 msg_zerocopy
 netlink-dumps
 nettest
+pppoe_bridge
+pppoe_csum
+pppoe_session
+pppoe_tso
 proc_net_pktgen
 psock_fanout
 psock_snd

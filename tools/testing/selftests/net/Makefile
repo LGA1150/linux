@@ -156,6 +156,10 @@ TEST_GEN_FILES := \
 	ipv6_flowlabel \
 	msg_zerocopy \
 	nettest \
+	pppoe_bridge \
+	pppoe_csum \
+	pppoe_session \
+	pppoe_tso \
 	psock_fanout \
 	psock_snd \
 	psock_tpacket \
@@ -209,6 +213,11 @@ TEST_FILES := \
 	fcnal-test.sh \
 	in_netns.sh \
 	lib.sh \
+	pppoe_bridge.rst \
+	pppoe_csum.rst \
+	pppoe_session.rst \
+	pppoe_tests.rst \
+	pppoe_tso.rst \
 	settings \
 # end of TEST_FILES
 
