@@ -71,6 +71,7 @@
 #include <linux/notifier.h>
 #include <linux/file.h>
 #include <linux/proc_fs.h>
+#include <linux/rhashtable.h>
 #include <linux/seq_file.h>
 
 #include <linux/nsproxy.h>
@@ -81,26 +82,26 @@
 
 #include <linux/uaccess.h>
 
-#define PPPOE_HASH_BITS CONFIG_PPPOE_HASH_BITS
-#define PPPOE_HASH_SIZE (1 << PPPOE_HASH_BITS)
-#define PPPOE_HASH_MASK	(PPPOE_HASH_SIZE - 1)
-
 static const struct proto_ops pppoe_ops;
 static const struct ppp_channel_ops pppoe_chan_ops;
 
 /* per-net private data for this module */
 static unsigned int pppoe_net_id __read_mostly;
 struct pppoe_net {
-	/*
-	 * we could use _single_ hash table for all
-	 * nets by injecting net id into the hash but
-	 * it would increase hash chains and add
-	 * a few additional math comparisons messy
-	 * as well, moreover in case of SMP less locking
-	 * controversy here
-	 */
-	struct pppox_sock __rcu *hash_table[PPPOE_HASH_SIZE];
+	struct rhashtable hash_table;
+	/* Keep socket walks independent of hash table resizing. */
+	struct hlist_head session_list;
+	/* Serializes updates to both the hash table and the socket list. */
 	spinlock_t hash_lock;
+};
+
+static const struct rhashtable_params pppoe_hash_params = {
+	.head_offset = offsetof(struct pppox_sock, node),
+	.key_offset = offsetof(struct pppox_sock, proto.pppoe.key),
+	/* The device name is not part of the session key. */
+	.key_len = offsetof(struct pppoe_key, pa.dev),
+	.nelem_hint = 8,
+	.automatic_shrinking = true,
 };
 
 /*
@@ -121,35 +122,6 @@ static inline struct pppoe_net *pppoe_pernet(struct net *net)
 	return net_generic(net, pppoe_net_id);
 }
 
-static inline int cmp_2_addr(struct pppoe_addr *a, struct pppoe_addr *b)
-{
-	return a->sid == b->sid && ether_addr_equal(a->remote, b->remote);
-}
-
-static inline int cmp_addr(struct pppoe_addr *a, __be16 sid, char *addr)
-{
-	return a->sid == sid && ether_addr_equal(a->remote, addr);
-}
-
-#if 8 % PPPOE_HASH_BITS
-#error 8 must be a multiple of PPPOE_HASH_BITS
-#endif
-
-static u8 hash_item(__be16 sid, const u8 addr[ETH_ALEN])
-{
-	const u16 *addr16 = (const u16 *)addr;
-	unsigned int i;
-	u16 hash16;
-	u8 hash;
-
-	hash16 = addr16[0] ^ addr16[1] ^ addr16[2] ^ (__force u16)sid;
-	hash = (hash16 >> 8) ^ hash16;
-	for (i = 8; (i >>= 1) >= PPPOE_HASH_BITS;)
-		hash ^= hash >> i;
-
-	return hash & PPPOE_HASH_MASK;
-}
-
 /**********************************************************************
  *
  *  Set/get/delete/rehash items  (internal versions)
@@ -158,63 +130,36 @@ static u8 hash_item(__be16 sid, const u8 addr[ETH_ALEN])
 static struct pppox_sock *__get_item(struct pppoe_net *pn, __be16 sid,
 				unsigned char *addr, int ifindex)
 {
-	int hash = hash_item(sid, addr);
-	struct pppox_sock *ret;
+	struct pppoe_key key = {
+		.ifindex = ifindex,
+		.pa.sid = sid,
+	};
 
-	ret = rcu_dereference(pn->hash_table[hash]);
-	while (ret) {
-		if (cmp_addr(&ret->pppoe_pa, sid, addr) &&
-		    ret->pppoe_ifindex == ifindex)
-			return ret;
-
-		ret = rcu_dereference(ret->next);
-	}
-
-	return NULL;
+	ether_addr_copy(key.pa.remote, addr);
+	return rhashtable_lookup(&pn->hash_table, &key, pppoe_hash_params);
 }
 
 static int __set_item(struct pppoe_net *pn, struct pppox_sock *po)
 {
-	int hash = hash_item(po->pppoe_pa.sid, po->pppoe_pa.remote);
-	struct pppox_sock *ret, *first;
+	int error;
 
-	first = rcu_dereference_protected(pn->hash_table[hash], lockdep_is_held(&pn->hash_lock));
-	ret = first;
-	while (ret) {
-		if (cmp_2_addr(&ret->pppoe_pa, &po->pppoe_pa) &&
-		    ret->pppoe_ifindex == po->pppoe_ifindex)
-			return -EALREADY;
+	error = rhashtable_lookup_insert_fast(&pn->hash_table, &po->node,
+					      pppoe_hash_params);
+	if (error)
+		return error == -EEXIST ? -EALREADY : error;
 
-		ret = rcu_dereference_protected(ret->next, lockdep_is_held(&pn->hash_lock));
-	}
-
-	RCU_INIT_POINTER(po->next, first);
-	rcu_assign_pointer(pn->hash_table[hash], po);
+	hlist_add_head_rcu(&po->sk.sk_node, &pn->session_list);
 
 	return 0;
 }
 
-static void __delete_item(struct pppoe_net *pn, const struct pppox_sock *po)
+static void __delete_item(struct pppoe_net *pn, struct pppox_sock *po)
 {
-	int hash = hash_item(po->pppoe_pa.sid, po->pppoe_pa.remote);
-	struct pppox_sock *ret, __rcu **src;
+	if (sk_unhashed(&po->sk))
+		return;
 
-	ret = rcu_dereference_protected(pn->hash_table[hash], lockdep_is_held(&pn->hash_lock));
-	src = &pn->hash_table[hash];
-
-	while (ret) {
-		if (ret == po) {
-			struct pppox_sock *next;
-
-			next = rcu_dereference_protected(ret->next,
-							 lockdep_is_held(&pn->hash_lock));
-			rcu_assign_pointer(*src, next);
-			break;
-		}
-
-		src = &ret->next;
-		ret = rcu_dereference_protected(ret->next, lockdep_is_held(&pn->hash_lock));
-	}
+	rhashtable_remove_fast(&pn->hash_table, &po->node, pppoe_hash_params);
+	__sk_del_node_init(&po->sk);
 }
 
 /**********************************************************************
@@ -234,7 +179,7 @@ static inline struct pppox_sock *get_item(struct pppoe_net *pn, __be16 sid,
 	return po;
 }
 
-static void delete_item(struct pppoe_net *pn, const struct pppox_sock *po)
+static void delete_item(struct pppoe_net *pn, struct pppox_sock *po)
 {
 	spin_lock(&pn->hash_lock);
 	__delete_item(pn, po);
@@ -251,59 +196,41 @@ static void delete_item(struct pppoe_net *pn, const struct pppox_sock *po)
 static void pppoe_flush_dev(struct net_device *dev)
 {
 	struct pppoe_net *pn;
-	int i;
+	struct sock *sk;
 
 	pn = pppoe_pernet(dev_net(dev));
 	spin_lock(&pn->hash_lock);
-	for (i = 0; i < PPPOE_HASH_SIZE; i++) {
-		struct pppox_sock *po = rcu_dereference_protected(pn->hash_table[i],
-								  lockdep_is_held(&pn->hash_lock));
-		struct sock *sk;
+	sk = sk_head(&pn->session_list);
+	while (sk) {
+		struct pppox_sock *po = pppox_sk(sk);
+		struct sock *next;
 
-		while (po) {
-			while (po && po->pppoe_dev != dev) {
-				po = rcu_dereference_protected(po->next,
-							       lockdep_is_held(&pn->hash_lock));
-			}
-
-			if (!po)
-				break;
-
-			sk = &po->sk;
-
-			/* We always grab the socket lock, followed by the
-			 * hash_lock, in that order.  Since we should hold the
-			 * sock lock while doing any unbinding, we need to
-			 * release the lock we're holding.  Hold a reference to
-			 * the sock so it doesn't disappear as we're jumping
-			 * between locks.
-			 */
-
-			sock_hold(sk);
-			spin_unlock(&pn->hash_lock);
-			lock_sock(sk);
-
-			if (po->pppoe_dev == dev &&
-			    sk->sk_state & (PPPOX_CONNECTED | PPPOX_BOUND)) {
-				pppox_unbind_sock(sk);
-				sk->sk_state_change(sk);
-				po->pppoe_dev = NULL;
-				dev_put(dev);
-			}
-
-			release_sock(sk);
-			sock_put(sk);
-
-			/* Restart the process from the start of the current
-			 * hash chain. We dropped locks so the world may have
-			 * change from underneath us.
-			 */
-
-			BUG_ON(pppoe_pernet(dev_net(dev)) == NULL);
-			spin_lock(&pn->hash_lock);
-			po = rcu_dereference_protected(pn->hash_table[i],
-						       lockdep_is_held(&pn->hash_lock));
+		if (po->pppoe_dev != dev) {
+			sk = sk_next(sk);
+			continue;
 		}
+
+		/* The socket lock must precede hash_lock. Keep a reference
+		 * while dropping hash_lock to unbind the socket.
+		 */
+		sock_hold(sk);
+		spin_unlock(&pn->hash_lock);
+		lock_sock(sk);
+
+		if (po->pppoe_dev == dev &&
+		    sk->sk_state & (PPPOX_CONNECTED | PPPOX_BOUND)) {
+			pppox_unbind_sock(sk);
+			sk->sk_state_change(sk);
+			po->pppoe_dev = NULL;
+			dev_put(dev);
+		}
+
+		release_sock(sk);
+		spin_lock(&pn->hash_lock);
+		/* A removed socket no longer has a valid list successor. */
+		next = sk_hashed(sk) ? sk_next(sk) : sk_head(&pn->session_list);
+		sock_put(sk);
+		sk = next;
 	}
 	spin_unlock(&pn->hash_lock);
 }
@@ -633,7 +560,6 @@ static int pppoe_connect(struct socket *sock, struct sockaddr_unsized *uservaddr
 		po->pppoe_ifindex = 0;
 		memset(&po->pppoe_pa, 0, sizeof(po->pppoe_pa));
 		memset(&po->chan, 0, sizeof(po->chan));
-		po->next = NULL;
 		po->num = 0;
 
 		sk->sk_state = PPPOX_NONE;
@@ -959,7 +885,7 @@ static int pppoe_seq_show(struct seq_file *seq, void *v)
 		goto out;
 	}
 
-	po = v;
+	po = pppox_sk(sk_entry(v));
 	dev_name = po->pppoe_pa.dev;
 
 	seq_printf(seq, "%08X %pM %8s\n",
@@ -968,61 +894,20 @@ out:
 	return 0;
 }
 
-static inline struct pppox_sock *pppoe_get_idx(struct pppoe_net *pn, loff_t pos)
-{
-	struct pppox_sock *po;
-	int i;
-
-	for (i = 0; i < PPPOE_HASH_SIZE; i++) {
-		po = rcu_dereference(pn->hash_table[i]);
-		while (po) {
-			if (!pos--)
-				goto out;
-			po = rcu_dereference(po->next);
-		}
-	}
-
-out:
-	return po;
-}
-
 static void *pppoe_seq_start(struct seq_file *seq, loff_t *pos)
 	__acquires(RCU)
 {
 	struct pppoe_net *pn = pppoe_pernet(seq_file_net(seq));
-	loff_t l = *pos;
 
 	rcu_read_lock();
-	return l ? pppoe_get_idx(pn, --l) : SEQ_START_TOKEN;
+	return seq_hlist_start_head_rcu(&pn->session_list, *pos);
 }
 
 static void *pppoe_seq_next(struct seq_file *seq, void *v, loff_t *pos)
 {
 	struct pppoe_net *pn = pppoe_pernet(seq_file_net(seq));
-	struct pppox_sock *po, *next;
 
-	++*pos;
-	if (v == SEQ_START_TOKEN) {
-		po = pppoe_get_idx(pn, 0);
-		goto out;
-	}
-	po = v;
-	next = rcu_dereference(po->next);
-	if (next)
-		po = next;
-	else {
-		int hash = hash_item(po->pppoe_pa.sid, po->pppoe_pa.remote);
-
-		po = NULL;
-		while (++hash < PPPOE_HASH_SIZE) {
-			po = rcu_dereference(pn->hash_table[hash]);
-			if (po)
-				break;
-		}
-	}
-
-out:
-	return po;
+	return seq_hlist_next_rcu(v, &pn->session_list, pos);
 }
 
 static void pppoe_seq_stop(struct seq_file *seq, void *v)
@@ -1070,22 +955,30 @@ static __net_init int pppoe_init_net(struct net *net)
 {
 	struct pppoe_net *pn = pppoe_pernet(net);
 	struct proc_dir_entry *pde;
+	int error;
 
+	INIT_HLIST_HEAD(&pn->session_list);
 	spin_lock_init(&pn->hash_lock);
+	error = rhashtable_init(&pn->hash_table, &pppoe_hash_params);
+	if (error)
+		return error;
 
 	pde = proc_create_net("pppoe", 0444, net->proc_net,
-			&pppoe_seq_ops, sizeof(struct seq_net_private));
-#ifdef CONFIG_PROC_FS
-	if (!pde)
+			      &pppoe_seq_ops, sizeof(struct seq_net_private));
+	if (IS_ENABLED(CONFIG_PROC_FS) && !pde) {
+		rhashtable_destroy(&pn->hash_table);
 		return -ENOMEM;
-#endif
+	}
 
 	return 0;
 }
 
 static __net_exit void pppoe_exit_net(struct net *net)
 {
+	struct pppoe_net *pn = pppoe_pernet(net);
+
 	remove_proc_entry("pppoe", net->proc_net);
+	rhashtable_destroy(&pn->hash_table);
 }
 
 static struct pernet_operations pppoe_net_ops = {

@@ -2,6 +2,9 @@
 
 top_srcdir = ../../../../..
 
+CFLAGS += -Wall -Wextra -O2 $(KHDR_INCLUDES)
+TEST_GEN_PROGS := pppoe_hash
+
 TEST_PROGS := \
 	ppp_async.sh \
 	pppoe.sh \

@@ -12,6 +12,7 @@
 #include <linux/if.h>
 #include <linux/netdevice.h>
 #include <linux/ppp_channel.h>
+#include <linux/rhashtable-types.h>
 #include <linux/skbuff.h>
 #include <linux/workqueue.h>
 #include <uapi/linux/if_pppox.h>
@@ -23,8 +24,10 @@ static inline struct pppoe_hdr *pppoe_hdr(const struct sk_buff *skb)
 
 struct pppoe_opt {
 	struct net_device      *dev;	  /* device associated with socket*/
-	int			ifindex;  /* ifindex of device associated with socket */
-	struct pppoe_addr	pa;	  /* what this socket is bound to*/
+	struct_group_tagged(pppoe_key, key,
+		int		ifindex;  /* device associated with socket */
+		struct pppoe_addr pa;	  /* what this socket is bound to */
+	);
 	struct work_struct      padt_work;/* Work item for handling PADT */
 };
 
@@ -41,7 +44,7 @@ struct pppox_sock {
 	/* struct sock must be the first member of pppox_sock */
 	struct sock sk;
 	struct ppp_channel chan;
-	struct pppox_sock __rcu	*next;	  /* for hash table */
+	struct rhash_head	node;	  /* for hash table */
 	union {
 		struct pppoe_opt pppoe;
 		struct pptp_opt  pptp;
