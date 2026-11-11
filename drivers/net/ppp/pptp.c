@@ -5,6 +5,7 @@
  *	Authors: Dmitry Kozlov <xeb@mail.ru>
  */
 
+#include <linux/bitmap.h>
 #include <linux/string.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -13,7 +14,6 @@
 #include <linux/netdevice.h>
 #include <linux/net.h>
 #include <linux/skbuff.h>
-#include <linux/vmalloc.h>
 #include <linux/init.h>
 #include <linux/ppp_channel.h>
 #include <linux/ppp_defs.h>
@@ -40,9 +40,10 @@
 #define PPTP_DRIVER_VERSION "0.8.5"
 
 #define MAX_CALLID 65535
+#define PPTP_HASH_SIZE 256
 
 static DECLARE_BITMAP(callid_bitmap, MAX_CALLID + 1);
-static struct pppox_sock __rcu **callid_sock;
+static struct hlist_head callid_hash[PPTP_HASH_SIZE];
 
 static DEFINE_SPINLOCK(chan_lock);
 
@@ -50,19 +51,29 @@ static struct proto pptp_sk_proto __read_mostly;
 static const struct ppp_channel_ops pptp_chan_ops;
 static const struct proto_ops pptp_ops;
 
+static u16 hash_callid(u16 call_id)
+{
+	u16 hash = call_id;
+
+	hash ^= hash >> 8;
+	return hash & (PPTP_HASH_SIZE - 1);
+}
+
 static struct pppox_sock *lookup_chan(u16 call_id, __be32 s_addr)
 {
-	struct pppox_sock *sock;
-	struct pptp_opt *opt;
+	struct pppox_sock *sock = NULL;
+	struct sock *sk;
 
 	rcu_read_lock();
-	sock = rcu_dereference(callid_sock[call_id]);
-	if (sock) {
-		opt = &sock->proto.pptp;
-		if (opt->dst_addr.sin_addr.s_addr != s_addr)
-			sock = NULL;
-		else
-			sock_hold(&sock->sk);
+	sk_for_each_rcu(sk, &callid_hash[hash_callid(call_id)]) {
+		struct pptp_opt *opt = &pppox_sk(sk)->proto.pptp;
+
+		if (opt->src_addr.call_id == call_id &&
+		    opt->dst_addr.sin_addr.s_addr == s_addr) {
+			sock = pppox_sk(sk);
+			sock_hold(sk);
+			break;
+		}
 	}
 	rcu_read_unlock();
 
@@ -71,24 +82,23 @@ static struct pppox_sock *lookup_chan(u16 call_id, __be32 s_addr)
 
 static int lookup_chan_dst(u16 call_id, __be32 d_addr)
 {
-	struct pppox_sock *sock;
+	struct sock *sk;
 	struct pptp_opt *opt;
 	int i;
 
 	rcu_read_lock();
-	i = 1;
-	for_each_set_bit_from(i, callid_bitmap, MAX_CALLID) {
-		sock = rcu_dereference(callid_sock[i]);
-		if (!sock)
-			continue;
-		opt = &sock->proto.pptp;
-		if (opt->dst_addr.call_id == call_id &&
-			  opt->dst_addr.sin_addr.s_addr == d_addr)
-			break;
+	for (i = 0; i < PPTP_HASH_SIZE; i++) {
+		sk_for_each_rcu(sk, &callid_hash[i]) {
+			opt = &pppox_sk(sk)->proto.pptp;
+			if (opt->dst_addr.call_id == call_id &&
+			    opt->dst_addr.sin_addr.s_addr == d_addr)
+				goto out;
+		}
 	}
+out:
 	rcu_read_unlock();
 
-	return i < MAX_CALLID;
+	return i < PPTP_HASH_SIZE;
 }
 
 static int add_chan(struct pppox_sock *sock,
@@ -111,7 +121,8 @@ static int add_chan(struct pppox_sock *sock,
 
 	sock->proto.pptp.src_addr = *sa;
 	set_bit(sa->call_id, callid_bitmap);
-	rcu_assign_pointer(callid_sock[sa->call_id], sock);
+	hlist_add_head_rcu(&sock->sk.sk_node,
+			   &callid_hash[hash_callid(sa->call_id)]);
 	spin_unlock(&chan_lock);
 
 	return 0;
@@ -124,8 +135,8 @@ out_err:
 static void del_chan(struct pppox_sock *sock)
 {
 	spin_lock(&chan_lock);
-	clear_bit(sock->proto.pptp.src_addr.call_id, callid_bitmap);
-	RCU_INIT_POINTER(callid_sock[sock->proto.pptp.src_addr.call_id], NULL);
+	if (__sk_del_node_init(&sock->sk))
+		clear_bit(sock->proto.pptp.src_addr.call_id, callid_bitmap);
 	spin_unlock(&chan_lock);
 }
 
@@ -649,14 +660,10 @@ static int __init pptp_init_module(void)
 	int err = 0;
 	pr_info("PPTP driver version " PPTP_DRIVER_VERSION "\n");
 
-	callid_sock = vzalloc(array_size(sizeof(void *), (MAX_CALLID + 1)));
-	if (!callid_sock)
-		return -ENOMEM;
-
 	err = gre_add_protocol(&gre_pptp_protocol, GREPROTO_PPTP);
 	if (err) {
 		pr_err("PPTP: can't add gre protocol\n");
-		goto out_mem_free;
+		return err;
 	}
 
 	err = proto_register(&pptp_sk_proto, 0);
@@ -677,8 +684,6 @@ out_unregister_sk_proto:
 	proto_unregister(&pptp_sk_proto);
 out_gre_del_protocol:
 	gre_del_protocol(&gre_pptp_protocol, GREPROTO_PPTP);
-out_mem_free:
-	vfree(callid_sock);
 
 	return err;
 }
@@ -688,7 +693,6 @@ static void __exit pptp_exit_module(void)
 	unregister_pppox_proto(PX_PROTO_PPTP);
 	proto_unregister(&pptp_sk_proto);
 	gre_del_protocol(&gre_pptp_protocol, GREPROTO_PPTP);
-	vfree(callid_sock);
 }
 
 module_init(pptp_init_module);
