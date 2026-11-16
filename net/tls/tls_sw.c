@@ -48,6 +48,19 @@
 
 #include "tls.h"
 
+/* Bound speculative ciphertext and plaintext retained by a reader. */
+#define TLS_RX_BATCH_RECORDS	8
+
+struct tls_rx_record {
+	struct list_head list;
+	struct sk_buff *skb;
+	struct sk_buff *plaintext;
+	char rec_seq[TLS_MAX_REC_SEQ_SIZE];
+	int err;
+	bool submitted;
+	bool announced;
+};
+
 struct tls_decrypt_async_error {
 	/* Protect the first failure and its byte counts across callbacks. */
 	spinlock_t lock;
@@ -61,7 +74,9 @@ struct tls_decrypt_arg {
 	bool zc;
 	bool async;
 	bool async_done;
+	bool from_queue;
 	u8 tail;
+	struct tls_rx_record *rec;
 	struct tls_decrypt_async_error *async_error;
 	size_t offset;
 	size_t copy_bytes;
@@ -72,6 +87,7 @@ struct tls_decrypt_arg {
 
 struct tls_decrypt_ctx {
 	struct sock *sk;
+	struct tls_rx_record *rec;
 	struct tls_decrypt_async_error *async_error;
 	size_t offset;
 	size_t copy_bytes;
@@ -81,6 +97,15 @@ struct tls_decrypt_ctx {
 	bool free_sgout;
 	struct scatterlist sg[];
 };
+
+static struct sk_buff *tls_rx_msg(struct tls_sw_context_rx *ctx)
+{
+	struct tls_rx_record *rec;
+
+	rec = list_first_entry_or_null(&ctx->rx_pending,
+				       struct tls_rx_record, list);
+	return rec ? rec->skb : tls_strp_msg(ctx);
+}
 
 noinline void tls_err_abort(struct sock *sk, int err)
 {
@@ -230,8 +255,10 @@ static void tls_decrypt_done(void *data, int err)
 	tls_ctx = tls_get_ctx(sk);
 	ctx = tls_sw_ctx_rx(tls_ctx);
 
-	/* Propagate if there was an err */
-	if (err) {
+	/* Speculative failures are interpreted in wire order by the reader. */
+	if (dctx->rec) {
+		dctx->rec->err = err;
+	} else if (err) {
 		struct tls_decrypt_async_error *error = dctx->async_error;
 		unsigned long flags;
 
@@ -1137,6 +1164,8 @@ tls_rx_rec_wait(struct sock *sk, bool nonblock, bool released, bool has_copied)
 	/* a rekey is pending, let userspace deal with it */
 	if (unlikely(ctx->key_update_pending))
 		return -EKEYEXPIRED;
+	if (!list_empty(&ctx->rx_pending))
+		return 1;
 
 	timeo = sock_rcvtimeo(sk, nonblock);
 
@@ -1305,7 +1334,7 @@ static int tls_decrypt_sg(struct sock *sk, struct iov_iter *out_iov,
 	struct tls_sw_context_rx *ctx = tls_sw_ctx_rx(tls_ctx);
 	struct tls_prot_info *prot = &tls_ctx->prot_info;
 	int n_sgin, n_sgout, aead_size, err, pages = 0;
-	struct sk_buff *skb = tls_strp_msg(ctx);
+	struct sk_buff *skb = darg->rec ? darg->rec->skb : tls_strp_msg(ctx);
 	const struct strp_msg *rxm = strp_msg(skb);
 	const struct tls_msg *tlm = tls_msg(skb);
 	struct aead_request *aead_req;
@@ -1315,6 +1344,7 @@ static int tls_decrypt_sg(struct sock *sk, struct iov_iter *out_iov,
 	int tail_pages = !!prot->tail_size;
 	struct tls_decrypt_ctx *dctx;
 	struct sk_buff *clear_skb;
+	char *rec_seq = darg->rec ? darg->rec->rec_seq : tls_ctx->rx.rec_seq;
 	int iv_offset = 0;
 	u8 *mem;
 
@@ -1361,6 +1391,7 @@ static int tls_decrypt_sg(struct sock *sk, struct iov_iter *out_iov,
 	aead_req = (struct aead_request *)mem;
 	dctx = (struct tls_decrypt_ctx *)(mem + aead_size);
 	dctx->sk = sk;
+	dctx->rec = darg->rec;
 	dctx->async_error = darg->async_error;
 	dctx->offset = darg->offset;
 	dctx->copy_bytes = darg->copy_bytes;
@@ -1392,12 +1423,11 @@ static int tls_decrypt_sg(struct sock *sk, struct iov_iter *out_iov,
 			goto exit_free;
 		memcpy(&dctx->iv[iv_offset], tls_ctx->rx.iv, prot->salt_size);
 	}
-	tls_xor_iv_with_seq(prot, &dctx->iv[iv_offset], tls_ctx->rx.rec_seq);
+	tls_xor_iv_with_seq(prot, &dctx->iv[iv_offset], rec_seq);
 
 	/* Prepare AAD */
 	tls_make_aad(dctx->aad, rxm->full_len - prot->overhead_size +
-		     prot->tail_size,
-		     tls_ctx->rx.rec_seq, tlm->control, prot);
+		     prot->tail_size, rec_seq, tlm->control, prot);
 
 	/* Prepare sgin */
 	sg_init_table(sgin, n_sgin);
@@ -1449,6 +1479,9 @@ static int tls_decrypt_sg(struct sock *sk, struct iov_iter *out_iov,
 	clear_skb = NULL;
 
 	if (unlikely(darg->async)) {
+		/* The batch owns its input until ordered processing or retry. */
+		if (darg->rec)
+			return 0;
 		err = tls_strp_msg_hold(&ctx->strp, &ctx->async_hold);
 		if (err) {
 			err = tls_decrypt_async_wait(ctx);
@@ -1596,6 +1629,155 @@ static int tls_check_pending_rekey(struct sock *sk, struct tls_context *ctx,
 	return 0;
 }
 
+static void tls_rx_record_free(struct tls_rx_record *rec)
+{
+	consume_skb(rec->plaintext);
+	consume_skb(rec->skb);
+	list_del(&rec->list);
+	kfree(rec);
+}
+
+static void tls_rx_batch_purge(struct tls_sw_context_rx *ctx)
+{
+	struct tls_rx_record *rec, *next;
+
+	list_for_each_entry_safe(rec, next, &ctx->rx_pending, list)
+		tls_rx_record_free(rec);
+}
+
+/* Every batch is drained under the socket lock. Rekey can therefore discard
+ * speculative results without racing a callback or changing an in-use key.
+ * The ciphertext remains available for a new submission after TLS_RX.
+ */
+static void tls_rx_batch_reset(struct tls_sw_context_rx *ctx)
+{
+	struct tls_rx_record *rec;
+
+	list_for_each_entry(rec, &ctx->rx_pending, list) {
+		consume_skb(rec->plaintext);
+		rec->plaintext = NULL;
+		rec->submitted = false;
+		rec->err = 0;
+	}
+}
+
+static int tls_rx_batch_collect(struct tls_sw_context_rx *ctx)
+{
+	struct sock *sk = ctx->strp.sk;
+	struct tls_rx_record *rec;
+	int count, err = 0;
+
+	for (count = 0; count < TLS_RX_BATCH_RECORDS; count++) {
+		if (!tls_strp_msg_ready(ctx) ||
+		    !tls_strp_msg_load(&ctx->strp, false))
+			break;
+
+		rec = kzalloc_obj(*rec, sk->sk_allocation);
+		if (!rec) {
+			err = -ENOMEM;
+			break;
+		}
+		rec->skb = tls_strp_msg_detach(ctx);
+		if (!rec->skb) {
+			kfree(rec);
+			err = -ENOMEM;
+			break;
+		}
+
+		list_add_tail(&rec->list, &ctx->rx_pending);
+		tls_strp_msg_consume(&ctx->strp);
+		tls_strp_check_rcv(&ctx->strp, false);
+	}
+
+	/* An allocation failure must not discard records already consumed. */
+	return list_empty(&ctx->rx_pending) ? err ?: -EAGAIN : 0;
+}
+
+static void tls_rx_batch_decrypt(struct sock *sk)
+{
+	struct tls_context *tls_ctx = tls_get_ctx(sk);
+	struct tls_sw_context_rx *ctx = tls_sw_ctx_rx(tls_ctx);
+	struct tls_prot_info *prot = &tls_ctx->prot_info;
+	char rec_seq[TLS_MAX_REC_SEQ_SIZE];
+	struct tls_rx_record *rec;
+	bool exhausted = false;
+	int err;
+
+	/* Advance only this speculative sequence. The connection's sequence is
+	 * committed as records are processed and replaced by userspace on rekey.
+	 */
+	memcpy(rec_seq, tls_ctx->rx.rec_seq, prot->rec_seq_size);
+	list_for_each_entry(rec, &ctx->rx_pending, list) {
+		struct tls_decrypt_arg darg = { .async = true, .rec = rec };
+
+		rec->submitted = true;
+		if (exhausted) {
+			rec->err = -EBADMSG;
+			continue;
+		}
+		memcpy(rec->rec_seq, rec_seq, prot->rec_seq_size);
+		exhausted = tls_bigint_increment(rec_seq, prot->rec_seq_size);
+
+		err = tls_decrypt_sg(sk, NULL, NULL, &darg);
+		if (err)
+			rec->err = err;
+		else
+			rec->plaintext = darg.skb;
+	}
+
+	/* Callbacks retain errors in each record, including -EBADMSG from
+	 * requests which unknowingly crossed an encrypted KeyUpdate.
+	 */
+	tls_decrypt_async_wait(ctx);
+}
+
+static int tls_rx_decrypt_record(struct sock *sk, struct tls_decrypt_arg *darg)
+{
+	struct tls_context *tls_ctx = tls_get_ctx(sk);
+	struct tls_sw_context_rx *ctx = tls_sw_ctx_rx(tls_ctx);
+	struct tls_rx_record *rec;
+	int err, pad;
+
+	if (list_empty(&ctx->rx_pending)) {
+		err = tls_rx_batch_collect(ctx);
+		if (err)
+			return err;
+	}
+
+	rec = list_first_entry(&ctx->rx_pending, struct tls_rx_record, list);
+	if (!rec->submitted)
+		tls_rx_batch_decrypt(sk);
+
+	err = rec->err;
+	if (err)
+		goto out;
+
+	darg->zc = false;
+	darg->async = false;
+	darg->from_queue = true;
+	darg->skb = rec->plaintext;
+	pad = tls_padding_length(&tls_ctx->prot_info, darg->skb, darg);
+	if (pad < 0) {
+		err = pad;
+		goto out;
+	}
+	strp_msg(darg->skb)->full_len -= pad;
+	rec->plaintext = NULL;
+out:
+	/* Only a failure at the head is fatal. Later results may still have
+	 * been computed with a key superseded by an earlier record.
+	 */
+	if (err) {
+		if (err == -EBADMSG)
+			TLS_INC_STATS(sock_net(sk), LINUX_MIB_TLSDECRYPTERROR);
+		ctx->async_wait.err = err;
+	}
+	tls_rx_record_free(rec);
+	if (err)
+		tls_rx_batch_purge(ctx);
+	return err;
+}
+
 /* On decrypt failure the connection is aborted (sk_err set) before
  * returning a negative errno.
  */
@@ -1608,9 +1790,14 @@ static int tls_rx_one_record(struct sock *sk, struct msghdr *msg,
 	struct strp_msg *rxm;
 	int err;
 
-	err = tls_decrypt_device(sk, msg, tls_ctx, darg);
-	if (!err)
-		err = tls_decrypt_sw(sk, tls_ctx, msg, darg);
+	if (ctx->async_capable && prot->version == TLS_1_3_VERSION &&
+	    tls_ctx->rx_conf == TLS_SW) {
+		err = tls_rx_decrypt_record(sk, darg);
+	} else {
+		err = tls_decrypt_device(sk, msg, tls_ctx, darg);
+		if (!err)
+			err = tls_decrypt_sw(sk, tls_ctx, msg, darg);
+	}
 	if (err < 0) {
 		tls_err_abort(sk, -EBADMSG);
 		return err;
@@ -1625,16 +1812,25 @@ static int tls_rx_one_record(struct sock *sk, struct msghdr *msg,
 	 * a burst of them traps the reader in the kernel. Treat more than
 	 * 128 in a row, without the reader sleeping or returning to the
 	 * caller in between, as a protocol violation. Stop the strparser
-	 * before the next record gets parsed, so the reader finds the
-	 * error in tls_rx_rec_wait().
+	 * and discard read-ahead so the reader finds the error in
+	 * tls_rx_rec_wait().
 	 */
 	if (rxm->full_len ||
 	    tls_msg(darg->skb)->control != TLS_RECORD_TYPE_DATA)
 		ctx->empty_run = 0;
-	else if (unlikely(++ctx->empty_run > 128))
+	else if (unlikely(++ctx->empty_run > 128)) {
 		tls_strp_abort_strp(&ctx->strp, -EBADMSG);
+		if (darg->from_queue) {
+			tls_rx_batch_purge(ctx);
+			if (tls_strp_msg_ready(ctx))
+				tls_strp_msg_consume(&ctx->strp);
+		}
+	}
 
-	return tls_check_pending_rekey(sk, tls_ctx, darg->skb);
+	err = tls_check_pending_rekey(sk, tls_ctx, darg->skb);
+	if (ctx->key_update_pending)
+		tls_rx_batch_reset(ctx);
+	return err;
 }
 
 int decrypt_skb(struct sock *sk, struct scatterlist *sgout)
@@ -1673,8 +1869,11 @@ static int tls_record_content_type(struct msghdr *msg, struct tls_msg *tlm,
 /* The deferred announce is fired once on reader exit by
  * tls_rx_reader_release().
  */
-static void tls_rx_rec_done(struct tls_sw_context_rx *ctx)
+static void tls_rx_rec_done(struct tls_sw_context_rx *ctx,
+			    const struct tls_decrypt_arg *darg)
 {
+	if (darg->from_queue)
+		return;
 	tls_strp_msg_consume(&ctx->strp);
 	tls_strp_check_rcv(&ctx->strp, false);
 }
@@ -1832,11 +2031,22 @@ static int tls_rx_reader_lock(struct sock *sk, struct tls_sw_context_rx *ctx,
 
 static void tls_rx_reader_release(struct sock *sk, struct tls_sw_context_rx *ctx)
 {
+	struct tls_rx_record *rec;
+
 	/* Fire any deferred announce once per reader so that a record
 	 * parsed but not yet announced becomes visible to the next
 	 * reader. The call is idempotent through msg_announced.
 	 */
-	tls_rx_msg_maybe_announce(&ctx->strp);
+	rec = list_first_entry_or_null(&ctx->rx_pending,
+				       struct tls_rx_record, list);
+	if (rec) {
+		if (!rec->announced && !ctx->key_update_pending) {
+			rec->announced = true;
+			ctx->saved_data_ready(sk);
+		}
+	} else {
+		tls_rx_msg_maybe_announce(&ctx->strp);
+	}
 
 	if (unlikely(ctx->reader_contended)) {
 		if (wq_has_sleeper(&ctx->wq))
@@ -1927,7 +2137,7 @@ int tls_sw_recvmsg(struct sock *sk,
 
 	zc_capable = !is_kvec && !is_peek && ctx->zc_capable;
 	decrypted = 0;
-	while (len && (decrypted + copied < target || tls_strp_msg_ready(ctx))) {
+	while (len && (decrypted + copied < target || tls_rx_msg_ready(ctx))) {
 		struct tls_decrypt_arg darg;
 		int to_decrypt, chunk;
 
@@ -1938,8 +2148,8 @@ int tls_sw_recvmsg(struct sock *sk,
 
 		memset(&darg.inargs, 0, sizeof(darg.inargs));
 
-		rxm = strp_msg(tls_strp_msg(ctx));
-		tlm = tls_msg(tls_strp_msg(ctx));
+		rxm = strp_msg(tls_rx_msg(ctx));
+		tlm = tls_msg(tls_rx_msg(ctx));
 
 		to_decrypt = rxm->full_len - prot->overhead_size;
 
@@ -1950,7 +2160,8 @@ int tls_sw_recvmsg(struct sock *sk,
 		/* Do not use async mode if record is non-data or empty,
 		 * recv_end would report an error after empty records as EOF.
 		 */
-		if (tlm->control == TLS_RECORD_TYPE_DATA)
+		if (tlm->control == TLS_RECORD_TYPE_DATA &&
+		    prot->version != TLS_1_3_VERSION)
 			darg.async = ctx->async_capable && to_decrypt;
 		else
 			darg.async = false;
@@ -1973,12 +2184,13 @@ int tls_sw_recvmsg(struct sock *sk,
 		 * but does not match the record type just dequeued, go to end.
 		 * We always get record type here since for tls1.2, record type
 		 * is known just after record is dequeued from stream parser.
-		 * For tls1.3, we disable async.
+		 * TLS 1.3 batches are completed and processed in wire order
+		 * by tls_rx_one_record() before it returns the content type.
 		 */
 		err = tls_record_content_type(msg, tls_msg(darg.skb), &control);
 		if (err <= 0) {
 			DEBUG_NET_WARN_ON_ONCE(darg.zc);
-			tls_rx_rec_done(ctx);
+			tls_rx_rec_done(ctx, &darg);
 put_on_rx_list_err:
 			__skb_queue_tail(&ctx->rx_list, darg.skb);
 			goto recv_end;
@@ -1992,7 +2204,7 @@ put_on_rx_list_err:
 		/* TLS 1.3 may have updated the length by more than overhead */
 		rxm = strp_msg(darg.skb);
 		chunk = rxm->full_len;
-		tls_rx_rec_done(ctx);
+		tls_rx_rec_done(ctx, &darg);
 
 		if (!darg.zc) {
 			bool partially_consumed = chunk > len;
@@ -2130,7 +2342,7 @@ ssize_t tls_sw_splice_read(struct socket *sock,  loff_t *ppos,
 			if (err < 0)
 				goto splice_read_end;
 
-			tls_rx_rec_done(ctx);
+			tls_rx_rec_done(ctx, &darg);
 			skb = darg.skb;
 		}
 
@@ -2228,7 +2440,7 @@ int tls_sw_read_sock(struct sock *sk, read_descriptor_t *desc,
 			tlm = tls_msg(skb);
 			decrypted += rxm->full_len;
 
-			tls_rx_rec_done(ctx);
+			tls_rx_rec_done(ctx, &darg);
 		}
 
 		/* read_sock does not support reading control messages */
@@ -2278,7 +2490,7 @@ bool tls_sw_sock_is_readable(struct sock *sk)
 	struct tls_context *tls_ctx = tls_get_ctx(sk);
 	struct tls_sw_context_rx *ctx = tls_sw_ctx_rx(tls_ctx);
 
-	return tls_strp_msg_ready(ctx) ||
+	return tls_rx_msg_ready(ctx) ||
 		!skb_queue_empty(&ctx->rx_list);
 }
 
@@ -2427,6 +2639,7 @@ void tls_sw_release_resources_rx(struct sock *sk)
 	struct tls_sw_context_rx *ctx = tls_sw_ctx_rx(tls_ctx);
 
 	if (ctx->aead_recv) {
+		tls_rx_batch_purge(ctx);
 		__skb_queue_purge(&ctx->rx_list);
 		crypto_free_aead(ctx->aead_recv);
 		tls_strp_stop(&ctx->strp);
@@ -2578,6 +2791,7 @@ static struct tls_sw_context_rx *init_ctx_rx(struct tls_context *ctx)
 	atomic_set(&sw_ctx_rx->decrypt_pending, 1);
 	init_waitqueue_head(&sw_ctx_rx->wq);
 	skb_queue_head_init(&sw_ctx_rx->rx_list);
+	INIT_LIST_HEAD(&sw_ctx_rx->rx_pending);
 	skb_queue_head_init(&sw_ctx_rx->async_hold);
 
 	return sw_ctx_rx;
@@ -2718,7 +2932,6 @@ int tls_set_sw_offload(struct sock *sk, int tx,
 
 		tls_update_rx_zc_capable(ctx);
 		sw_ctx_rx->async_capable =
-			src_crypto_info->version != TLS_1_3_VERSION &&
 			!!(tfm->__crt_alg->cra_flags & CRYPTO_ALG_ASYNC);
 
 		rc = tls_strp_init(&sw_ctx_rx->strp, sk);
@@ -2735,8 +2948,10 @@ int tls_set_sw_offload(struct sock *sk, int tx,
 			      cipher_desc->crypto_info,
 			      /* size was checked in do_tls_setsockopt_conf */);
 		memzero_explicit(new_crypto_info, cipher_desc->crypto_info);
-		if (!tx)
+		if (!tx) {
+			tls_rx_batch_reset(sw_ctx_rx);
 			tls_finish_key_update(sk, ctx);
+		}
 	}
 
 	goto out;

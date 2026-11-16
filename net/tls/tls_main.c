@@ -415,7 +415,7 @@ static __poll_t tls_sk_poll(struct file *file, struct socket *sock,
 	ctx = tls_sw_ctx_rx(tls_ctx);
 
 	if ((skb_queue_empty_lockless(&ctx->rx_list) &&
-	     !tls_strp_msg_ready(ctx)) ||
+	     !tls_rx_msg_ready(ctx)) ||
 	    READ_ONCE(ctx->key_update_pending))
 		mask &= ~(EPOLLIN | EPOLLRDNORM);
 
