@@ -1797,8 +1797,13 @@ static int tls_rx_one_record(struct sock *sk, struct msghdr *msg,
 	struct strp_msg *rxm;
 	int err;
 
-	if (ctx->async_capable && prot->version == TLS_1_3_VERSION &&
-	    tls_ctx->rx_conf == TLS_SW) {
+	/* Keep TLS 1.2 recvmsg's direct-to-user async path. Splice and
+	 * read_sock need authenticated kernel buffers, as does a recvmsg
+	 * which follows a reader that has already collected a batch.
+	 */
+	if (ctx->async_capable && tls_ctx->rx_conf == TLS_SW &&
+	    (prot->version == TLS_1_3_VERSION || !msg ||
+	     !list_empty(&ctx->rx_pending))) {
 		err = tls_rx_decrypt_record(sk, darg);
 	} else {
 		err = tls_decrypt_device(sk, msg, tls_ctx, darg);
