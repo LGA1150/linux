@@ -598,6 +598,13 @@ static int tls_do_encryption(struct sock *sk,
 	struct scatterlist *sge = sk_msg_elem(msg_en, start);
 	int rc, iv_offset = 0;
 
+	/* Reject exhaustion before handing the record to an async cipher.
+	 * Otherwise tls_advance_record_sn() races the completion callback:
+	 * send may succeed or fail depending on when sk_err becomes visible.
+	 */
+	if (!memchr_inv(tls_ctx->tx.rec_seq, 0xff, prot->rec_seq_size))
+		return -EBADMSG;
+
 	/* For CCM based ciphers, first byte of IV is a constant */
 	switch (prot->cipher_type) {
 	case TLS_CIPHER_AES_CCM_128:
