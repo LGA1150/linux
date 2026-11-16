@@ -131,6 +131,7 @@ struct tls_sw_context_rx {
 	struct crypto_aead *aead_recv;
 	struct crypto_wait async_wait;
 	struct sk_buff_head rx_list;	/* list of decrypted 'data' records */
+	struct list_head rx_pending;	/* TLS 1.3 records, in wire order */
 	void (*saved_data_ready)(struct sock *sk);
 
 	u8 reader_present;

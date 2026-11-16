@@ -280,6 +280,11 @@ If the record decrypted turns out to had been padded or is not a data
 record it will be decrypted again into a kernel buffer without zero copy.
 Such events are counted in the ``TlsDecryptRetry`` statistic.
 
+With an asynchronous receive cipher, TLS 1.3 decrypts into kernel buffers
+in bounded batches even when this option is enabled. Record contents are
+processed in order after completion. Ciphertext submitted beyond a KeyUpdate
+is retained and retried after userspace installs the new receive key.
+
 Statistics
 ==========
 

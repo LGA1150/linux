@@ -222,6 +222,11 @@ static inline bool tls_strp_msg_ready(struct tls_sw_context_rx *ctx)
 	return READ_ONCE(ctx->strp.msg_ready);
 }
 
+static inline bool tls_rx_msg_ready(struct tls_sw_context_rx *ctx)
+{
+	return !list_empty(&ctx->rx_pending) || tls_strp_msg_ready(ctx);
+}
+
 static inline bool tls_strp_msg_mixed_decrypted(struct tls_sw_context_rx *ctx)
 {
 	return ctx->strp.mixed_decrypted;

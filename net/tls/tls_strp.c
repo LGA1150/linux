@@ -86,15 +86,6 @@ struct sk_buff *tls_strp_msg_detach(struct tls_sw_context_rx *ctx)
 {
 	struct tls_strparser *strp = &ctx->strp;
 
-#ifdef CONFIG_TLS_DEVICE
-	DEBUG_NET_WARN_ON_ONCE(!strp->anchor->decrypted);
-#else
-	/* This function turns an input into an output,
-	 * that can only happen if we have offload.
-	 */
-	WARN_ON(1);
-#endif
-
 	if (strp->copy_mode) {
 		struct sk_buff *skb;
 

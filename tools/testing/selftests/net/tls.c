@@ -1983,6 +1983,59 @@ TEST_F(tls, rekey)
 	EXPECT_EQ(memcmp(buf, test_str_2, send_len), 0);
 }
 
+/* Queue several key generations before the first receive. An RX pipeline
+ * must retain records submitted with an old key and retry them after rekey.
+ */
+TEST_F(tls, rekey_queued_records)
+{
+	struct tls_crypto_info_keys keys[3];
+	char records[3][3][64], buf[64];
+	struct pollfd pfd = { .fd = self->cfd, .events = POLLIN };
+	int generation, record;
+
+	if (variant->tls_version != TLS_1_3_VERSION)
+		return;
+	if (self->notls)
+		SKIP(return, "no TLS support");
+
+	for (generation = 0; generation < 3; generation++) {
+		tls_crypto_info_init(variant->tls_version, variant->cipher_type,
+				     &keys[generation], generation);
+		if (generation) {
+			tls_send_keyupdate(_metadata, self->fd);
+			ASSERT_EQ(setsockopt(self->fd, SOL_TLS, TLS_TX,
+					    &keys[generation], keys[generation].len), 0);
+		}
+		for (record = 0; record < 3; record++) {
+			memset(records[generation][record], generation * 3 + record,
+			       sizeof(buf));
+			ASSERT_EQ(send(self->fd, records[generation][record],
+				       sizeof(buf), 0), sizeof(buf));
+		}
+	}
+
+	for (generation = 0; generation < 3; generation++) {
+		if (generation) {
+			tls_recv_keyupdate(_metadata, self->cfd, MSG_PEEK);
+			tls_recv_keyupdate(_metadata, self->cfd, 0);
+			EXPECT_EQ(recv(self->cfd, buf, sizeof(buf), MSG_DONTWAIT), -1);
+			EXPECT_EQ(errno, EKEYEXPIRED);
+			EXPECT_EQ(poll(&pfd, 1, 0), 0);
+			ASSERT_EQ(setsockopt(self->cfd, SOL_TLS, TLS_RX,
+					    &keys[generation], keys[generation].len), 0);
+		}
+		for (record = 0; record < 3; record++) {
+			EXPECT_EQ(poll(&pfd, 1, 1000), 1);
+			ASSERT_EQ(recv(self->cfd, buf, 1, MSG_PEEK), 1);
+			EXPECT_EQ(buf[0], records[generation][record][0]);
+			ASSERT_EQ(recv(self->cfd, buf, sizeof(buf), MSG_WAITALL), sizeof(buf));
+			EXPECT_EQ(memcmp(buf, records[generation][record], sizeof(buf)), 0);
+		}
+	}
+	EXPECT_EQ(recv(self->cfd, buf, sizeof(buf), MSG_DONTWAIT), -1);
+	EXPECT_EQ(errno, EAGAIN);
+}
+
 TEST_F(tls, rekey_fail)
 {
 	char const *test_str_1 = "test_message_before_rekey";
@@ -2619,6 +2672,14 @@ FIXTURE_VARIANT_ADD(zero_len_run, 129)
 	.ret = { -EBADMSG, -EAGAIN, },
 };
 
+/* Leave data beyond a full batch of empty records after the limit. */
+FIXTURE_VARIANT_ADD(zero_len_run, 136)
+{
+	.n = { 136, 0, },
+	.data = { true, false, },
+	.ret = { -EBADMSG, -EAGAIN, },
+};
+
 /* The count starts over on every read */
 FIXTURE_VARIANT_ADD(zero_len_run, 128_128)
 {
@@ -2826,6 +2887,116 @@ TEST_F(tls_err, bad_auth)
 	EXPECT_EQ(errno, EBADMSG);
 	EXPECT_EQ(recv(self->cfd2, buf, sizeof(buf), 0), -1);
 	EXPECT_EQ(errno, EBADMSG);
+}
+
+/* A record that did not authenticate breaks the connection for every
+ * reader, splice included.
+ *
+ * The two decrypt paths reach that result differently. A synchronous
+ * decrypt leaves the record parsed, so the splice re-runs the decrypt
+ * and fails on the record itself; the ctx->async_wait.err check in
+ * tls_sw_splice_read() is not what stops it. Only an asynchronous
+ * decrypt with an AEAD advertising CRYPTO_ALG_ASYNC consumes the record
+ * before the failure is recorded, leaving that check the sole reason the
+ * splice fails.
+ */
+TEST_F(tls_err, bad_auth_splice)
+{
+	char buf[128];
+	ssize_t ret;
+	int p[2];
+
+	if (self->notls)
+		SKIP(return, "no TLS support");
+
+	tls_send_bad_auth(_metadata, self->fd, self->cfd, self->fd2);
+
+	EXPECT_EQ(recv(self->cfd2, buf, sizeof(buf), 0), -1);
+	EXPECT_EQ(errno, EBADMSG);
+
+	ASSERT_GE(pipe(p), 0);
+
+	ret = splice(self->cfd2, NULL, p[1], NULL, sizeof(buf),
+		     SPLICE_F_NONBLOCK);
+	EXPECT_EQ(ret, -1);
+	EXPECT_EQ(errno, EBADMSG);
+
+	close(p[0]);
+	close(p[1]);
+}
+
+TEST_F(tls_err, rekey_bad_auth)
+{
+	struct tls_crypto_info_keys keys;
+	char buf[128];
+	int len;
+
+	if (variant->tls_version != TLS_1_3_VERSION)
+		return;
+	if (self->notls)
+		SKIP(return, "no TLS support");
+
+	/* Forward an intact KeyUpdate, then corrupt a record using the new
+	 * key. A speculative failure must be retried, but never ignored.
+	 */
+	tls_send_keyupdate(_metadata, self->fd);
+	ASSERT_EQ(recv(self->cfd, buf, TLS_HDR_LEN, MSG_WAITALL), TLS_HDR_LEN);
+	len = ((unsigned char)buf[3] << 8) | (unsigned char)buf[4];
+	ASSERT_GT(len, 0);
+	ASSERT_LE(len, (int)sizeof(buf) - TLS_HDR_LEN);
+	ASSERT_EQ(recv(self->cfd, buf + TLS_HDR_LEN, len, MSG_WAITALL), len);
+	ASSERT_EQ(send(self->fd2, buf, TLS_HDR_LEN + len, 0), TLS_HDR_LEN + len);
+
+	tls_crypto_info_init(TLS_1_3_VERSION, TLS_CIPHER_AES_GCM_128, &keys, 1);
+	ASSERT_EQ(setsockopt(self->fd, SOL_TLS, TLS_TX, &keys, keys.len), 0);
+	tls_send_bad_auth(_metadata, self->fd, self->cfd, self->fd2);
+
+	tls_recv_keyupdate(_metadata, self->cfd2, 0);
+	ASSERT_EQ(setsockopt(self->cfd2, SOL_TLS, TLS_RX, &keys, keys.len), 0);
+	EXPECT_EQ(recv(self->cfd2, buf, sizeof(buf), 0), -1);
+	EXPECT_EQ(errno, EBADMSG);
+	EXPECT_EQ(recv(self->cfd2, buf, sizeof(buf), MSG_DONTWAIT), -1);
+	EXPECT_EQ(errno, EBADMSG);
+}
+
+TEST_F(tls_err, padded_records)
+{
+	/* AES-GCM-128, zero key/IV, sequences 0, 1, 2. Application data
+	 * "first", "", "second" with 15, 31, 7 bytes of TLS 1.3 padding.
+	 */
+	static const unsigned char records[] = {
+		0x17, 0x03, 0x03, 0x00, 0x25, 0x65, 0xe1, 0xa8,
+		0xbd, 0x14, 0xa1, 0xa3, 0x92, 0xf3, 0x28, 0xc2,
+		0xb9, 0x71, 0xb2, 0xfe, 0x78, 0xf7, 0x95, 0xaa,
+		0xab, 0x49, 0x57, 0xfc, 0x65, 0xdf, 0x64, 0x87,
+		0xe4, 0x10, 0x25, 0xd8, 0xfc, 0x0c, 0x9b, 0x35,
+		0xcc, 0x6b, 0x17, 0x03, 0x03, 0x00, 0x30, 0x79,
+		0x01, 0xd9, 0x30, 0x07, 0x88, 0x72, 0xbd, 0x5b,
+		0x32, 0xec, 0x94, 0x65, 0xfd, 0x47, 0x98, 0xc5,
+		0xa8, 0x01, 0x34, 0x59, 0xf6, 0xb7, 0x7b, 0x83,
+		0xcd, 0xf5, 0xc5, 0xc5, 0xff, 0x5f, 0xc5, 0x88,
+		0xf7, 0xd6, 0x2a, 0xb6, 0x9a, 0x8a, 0x26, 0x5f,
+		0x82, 0xdb, 0x54, 0x12, 0xf6, 0xba, 0x9b, 0x17,
+		0x03, 0x03, 0x00, 0x1e, 0xa2, 0x72, 0x43, 0xf4,
+		0x1d, 0x39, 0xe1, 0xac, 0x68, 0x3c, 0xec, 0xcb,
+		0x97, 0x03, 0xa5, 0xac, 0xe4, 0xa4, 0x68, 0x1e,
+		0xf9, 0x9c, 0x98, 0x69, 0xe2, 0x33, 0x70, 0xb7,
+		0xda, 0xf3,
+	};
+	char buf[11];
+
+	if (variant->tls_version != TLS_1_3_VERSION)
+		return;
+	if (self->notls)
+		SKIP(return, "no TLS support");
+
+	ASSERT_EQ(send(self->fd2, records, sizeof(records), 0), sizeof(records));
+	ASSERT_EQ(recv(self->cfd2, buf, sizeof(buf), MSG_PEEK | MSG_WAITALL), sizeof(buf));
+	EXPECT_EQ(memcmp(buf, "firstsecond", sizeof(buf)), 0);
+	ASSERT_EQ(recv(self->cfd2, buf, sizeof(buf), MSG_WAITALL), sizeof(buf));
+	EXPECT_EQ(memcmp(buf, "firstsecond", sizeof(buf)), 0);
+	EXPECT_EQ(recv(self->cfd2, buf, sizeof(buf), MSG_DONTWAIT), -1);
+	EXPECT_EQ(errno, EAGAIN);
 }
 
 TEST_F(tls_err, bad_in_large_read)
