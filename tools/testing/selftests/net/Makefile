@@ -159,6 +159,7 @@ TEST_GEN_FILES := \
 	tcp_mmap \
 	tfo \
 	timestamping \
+	tls_rx_bench \
 	toeplitz \
 	txring_overwrite \
 	txtimestamp \
