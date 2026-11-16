@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Standalone kTLS RX/TX benchmark (AES-GCM-128, TLS 1.2 or 1.3).
+ * Standalone kTLS RX/TX benchmark (AES-GCM/CCM, TLS 1.2 or 1.3).
  *
  * Build: gcc -O2 -Wall -Wextra -pthread -o tls_rx_bench tls_rx_bench.c
  * Run:   ./tls_rx_bench -v 1.3 -s 16384 -n 4096 -b 64 -r 5
@@ -8,6 +8,14 @@
  *        ./tls_rx_bench -d tx -m send -v 1.3 -n 4096 -b 64 -r 5
  *        ./tls_rx_bench -d tx -m splice -v 1.2 -n 4096 -b 64 -r 5
  *        ./tls_rx_bench -j 4 -m splice -v 1.2 -n 4096
+ *        ./tls_rx_bench -d tx -c gcm -k 256 -j 4
+ *        ./tls_rx_bench -c ccm -k 128 -m splice -v 1.3
+ *
+ * -c selects gcm (default) or ccm; -k selects the AES key length in bits
+ * (default 128). kTLS supports GCM with 128/256-bit keys and CCM with a
+ * 128-bit key and 16-byte tag. AES-192, CCM-256 and CCM-8 are not exposed
+ * by the kTLS UAPI. Cipher selection applies to preparation, every worker,
+ * timed I/O and verification, in either direction and with either TLS version.
  *
  * Generate ciphertext with kTLS TX before timing. A separate thread feeds
  * these records over plain loopback TCP to kTLS RX. Every trial uses a fresh
@@ -82,8 +90,42 @@ enum io_mode {
 	IO_SPLICE,
 };
 
+struct cipher {
+	const char *mode, *name;
+	unsigned int type, key_bits, iv_size, tag_size;
+	socklen_t info_len;
+};
+
+static const struct cipher ciphers[] = {
+	{
+		.mode = "gcm", .name = "AES-GCM-128",
+		.type = TLS_CIPHER_AES_GCM_128,
+		.key_bits = 8 * TLS_CIPHER_AES_GCM_128_KEY_SIZE,
+		.iv_size = TLS_CIPHER_AES_GCM_128_IV_SIZE,
+		.tag_size = TLS_CIPHER_AES_GCM_128_TAG_SIZE,
+		.info_len = sizeof(struct tls12_crypto_info_aes_gcm_128),
+	},
+	{
+		.mode = "gcm", .name = "AES-GCM-256",
+		.type = TLS_CIPHER_AES_GCM_256,
+		.key_bits = 8 * TLS_CIPHER_AES_GCM_256_KEY_SIZE,
+		.iv_size = TLS_CIPHER_AES_GCM_256_IV_SIZE,
+		.tag_size = TLS_CIPHER_AES_GCM_256_TAG_SIZE,
+		.info_len = sizeof(struct tls12_crypto_info_aes_gcm_256),
+	},
+	{
+		.mode = "ccm", .name = "AES-CCM-128",
+		.type = TLS_CIPHER_AES_CCM_128,
+		.key_bits = 8 * TLS_CIPHER_AES_CCM_128_KEY_SIZE,
+		.iv_size = TLS_CIPHER_AES_CCM_128_IV_SIZE,
+		.tag_size = TLS_CIPHER_AES_CCM_128_TAG_SIZE,
+		.info_len = sizeof(struct tls12_crypto_info_aes_ccm_128),
+	},
+};
+
 struct options {
 	enum io_mode mode;
+	const struct cipher *cipher;
 	bool tx;
 	unsigned int version;
 	size_t size, records, read_records, prefill;
@@ -281,16 +323,25 @@ static void tcp_pair(int pair[2])
 	}
 }
 
-static void enable_tls(int fd, int direction, unsigned int version)
+static void enable_tls(int fd, int direction, const struct options *opt)
 {
-	struct tls12_crypto_info_aes_gcm_128 info = { 0 };
+	union {
+		struct tls_crypto_info info;
+		struct tls12_crypto_info_aes_gcm_128 gcm128;
+		struct tls12_crypto_info_aes_gcm_256 gcm256;
+		struct tls12_crypto_info_aes_ccm_128 ccm128;
+	} info;
 
-	info.info.version = version;
-	info.info.cipher_type = TLS_CIPHER_AES_GCM_128;
+	/* Fixed zero keys, nonces and initial sequences for this local test. */
+	memset(&info, 0, sizeof(info));
+	info.info.version = opt->version;
+	info.info.cipher_type = opt->cipher->type;
 	if (setsockopt(fd, IPPROTO_TCP, TCP_ULP, "tls", sizeof("tls")))
 		sys_fail("TCP_ULP tls (requires CONFIG_TLS / tls module)");
-	if (setsockopt(fd, SOL_TLS, direction, &info, sizeof(info)))
-		sys_fail(direction == TLS_TX ? "TLS_TX AES-GCM-128" : "TLS_RX AES-GCM-128");
+	if (setsockopt(fd, SOL_TLS, direction, &info, opt->cipher->info_len))
+		fail("%s %s (TLS %s): %s", direction == TLS_TX ? "TLS_TX" : "TLS_RX",
+		     opt->cipher->name, opt->version == TLS_1_2_VERSION ? "1.2" : "1.3",
+		     strerror(errno));
 }
 
 static void send_all(int fd, const unsigned char *buf, size_t len)
@@ -400,7 +451,7 @@ static void prepare(const struct options *opt, unsigned char *cipher, size_t wir
 	int pair[2];
 
 	tcp_pair(pair);
-	enable_tls(pair[0], TLS_TX, opt->version);
+	enable_tls(pair[0], TLS_TX, opt);
 	peer.fd = pair[0];
 	thread_check(pthread_create(&thread, NULL, prepare_sender, &peer),
 		     "create preparation sender");
@@ -484,7 +535,7 @@ static struct result run_rx(const struct options *opt, const unsigned char *ciph
 	double cpu;
 
 	tcp_pair(pair);
-	enable_tls(pair[1], TLS_RX, opt->version);
+	enable_tls(pair[1], TLS_RX, opt);
 	/* Bound the prefill, leaving room for TCP skb overhead. */
 	budget = get_int(pair[0], SOL_SOCKET, SO_SNDBUF) / 4;
 	limit = get_int(pair[1], SOL_SOCKET, SO_RCVBUF) / 4;
@@ -617,7 +668,7 @@ static struct result run_tx(const struct options *opt, unsigned char *cipher,
 	double cpu;
 
 	tcp_pair(pair);
-	enable_tls(pair[0], TLS_TX, opt->version);
+	enable_tls(pair[0], TLS_TX, opt);
 	/* Fault in the sink's capture buffer before timing. */
 	memset(cipher, 0, wire_len);
 	if (pipe(ready) || pipe(done))
@@ -793,7 +844,9 @@ static void usage(const char *prog)
 	printf("Usage: %s [options]\n"
 	       "  -d rx|tx    measured direction (default rx)\n"
 	       "  -m MODE     recv/send (default for rx/tx) or splice\n"
-	       "  -v 1.2|1.3  TLS version (default 1.3), AES-GCM-128\n"
+	       "  -v 1.2|1.3  TLS version (default 1.3)\n"
+	       "  -c gcm|ccm  AES mode (default gcm)\n"
+	       "  -k BITS     AES key length: GCM 128/256, CCM 128 (default 128)\n"
 	       "  -s BYTES    plaintext bytes per record, 1..16384 (16384)\n"
 	       "  -n RECORDS  total records per trial (4096, i.e. 64 MiB by default)\n"
 	       "  -j THREADS  parallel TLS connections/worker threads, 1..1024 (1)\n"
@@ -805,7 +858,8 @@ static void usage(const char *prog)
 	       "  -T CPU      pin transmitter/raw RX feeder (default: unpinned)\n"
 	       "  -h          show help\n\n"
 	       "One C file; libc, pthreads (-pthread) and Linux UAPI headers only.\n"
-	       "No root required if kTLS and AES-GCM are available.\n"
+	       "No root required if kTLS and the selected AEAD are available.\n"
+	       "Supported: AES-GCM-128, AES-GCM-256, AES-CCM-128 (16-byte tags).\n"
 	       "Backend selection is external.\n"
 	       "-n is divided evenly across -j workers and must be at least -j.\n"
 	       "Each worker has its own TLS socket and a raw peer thread. All workers\n"
@@ -843,14 +897,14 @@ int main(int argc, char **argv)
 	};
 	double total_seconds = 0, *rates, median;
 	struct worker *workers;
-	const char *mode, *validation;
+	const char *mode, *validation, *cipher_mode = "gcm";
 	size_t wire_size, plain_len;
 	bool prefill_set = false;
 	struct utsname uts;
-	unsigned int i;
+	unsigned int i, key_bits = 128;
 	int c;
 
-	while ((c = getopt(argc, argv, "d:m:v:s:n:j:b:p:r:w:R:T:h")) != -1) {
+	while ((c = getopt(argc, argv, "d:m:v:c:k:s:n:j:b:p:r:w:R:T:h")) != -1) {
 		switch (c) {
 		case 'd':
 			if (!strcmp(optarg, "rx"))
@@ -877,6 +931,14 @@ int main(int argc, char **argv)
 				opt.version = TLS_1_3_VERSION;
 			else
 				fail("TLS version must be 1.2 or 1.3");
+			break;
+		case 'c':
+			if (strcmp(optarg, "gcm") && strcmp(optarg, "ccm"))
+				fail("AES mode must be gcm or ccm");
+			cipher_mode = optarg;
+			break;
+		case 'k':
+			key_bits = parse_number(optarg, 128, 256);
 			break;
 		case 's':
 			opt.size = parse_number(optarg, 1, MAX_RECORD_SIZE);
@@ -916,6 +978,15 @@ int main(int argc, char **argv)
 	}
 	if (optind != argc)
 		fail("unexpected argument: %s", argv[optind]);
+	for (i = 0; i < ARRAY_SIZE(ciphers); i++) {
+		if (!strcmp(cipher_mode, ciphers[i].mode) && key_bits == ciphers[i].key_bits) {
+			opt.cipher = &ciphers[i];
+			break;
+		}
+	}
+	if (!opt.cipher)
+		fail("unsupported AES-%s-%u; kTLS supports gcm-128, gcm-256 and ccm-128",
+		     cipher_mode, key_bits);
 	if (opt.mode == IO_DEFAULT)
 		opt.mode = opt.tx ? IO_SEND : IO_RECV;
 	if ((opt.tx && opt.mode == IO_RECV) || (!opt.tx && opt.mode == IO_SEND))
@@ -927,7 +998,8 @@ int main(int argc, char **argv)
 	mode = opt.mode == IO_SPLICE ? "splice" : opt.tx ? "send" : "recv";
 	validation = !opt.tx && opt.mode == IO_SPLICE ? "length" : "plaintext";
 	/* TLS header + tag + explicit nonce (1.2) or inner content type (1.3). */
-	wire_size = opt.size + 5 + 16 + (opt.version == TLS_1_2_VERSION ? 8 : 1);
+	wire_size = opt.size + 5 + opt.cipher->tag_size +
+		(opt.version == TLS_1_2_VERSION ? opt.cipher->iv_size : 1);
 	if (opt.records > SIZE_MAX / wire_size)
 		fail("record count overflows the ciphertext buffer size");
 	plain_len = opt.size * opt.records;
@@ -936,9 +1008,9 @@ int main(int argc, char **argv)
 		sys_fail("sched_getaffinity");
 	if (uname(&uts))
 		sys_fail("uname");
-	printf("# kernel=%s machine=%s tls=%s cipher=AES-GCM-128 direction=%s mode=%s\n",
+	printf("# kernel=%s machine=%s tls=%s cipher=%s direction=%s mode=%s\n",
 	       uts.release, uts.machine, opt.version == TLS_1_2_VERSION ? "1.2" : "1.3",
-	       opt.tx ? "tx" : "rx", mode);
+	       opt.cipher->name, opt.tx ? "tx" : "rx", mode);
 	printf("# record_bytes=%zu records=%zu plaintext_bytes=%zu %s=%zu",
 	       opt.size, opt.records, plain_len, opt.tx ? "tx_batch_records" : "read_records",
 	       opt.tx && opt.size < MAX_RECORD_SIZE ? 1 : opt.read_records);
