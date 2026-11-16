@@ -219,6 +219,10 @@ before the new key is provided will fail with EKEYEXPIRED. poll() will
 not report any read events from the socket until the new key is
 provided. There is no pausing on the transmit side.
 
+Updating TLS_TX flushes an open record and waits for outstanding encryptions
+before changing the key. Plaintext accepted before the update uses the old
+key; subsequent sends use the new key.
+
 Userspace should make sure that the crypto_info provided has been set
 properly. In particular, the kernel will not check for key/nonce
 reuse.

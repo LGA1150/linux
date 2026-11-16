@@ -823,15 +823,24 @@ static int do_tls_setsockopt_no_pad(struct sock *sk, sockptr_t optval,
 static int do_tls_setsockopt(struct sock *sk, int optname, sockptr_t optval,
 			     unsigned int optlen)
 {
+	struct tls_context *ctx;
 	int rc = 0;
 
 	switch (optname) {
 	case TLS_TX:
 	case TLS_RX:
+		ctx = tls_get_ctx(sk);
+		if (optname == TLS_TX) {
+			rc = mutex_lock_interruptible(&ctx->tx_lock);
+			if (rc)
+				break;
+		}
 		lock_sock(sk);
 		rc = do_tls_setsockopt_conf(sk, optval, optlen,
 					    optname == TLS_TX);
 		release_sock(sk);
+		if (optname == TLS_TX)
+			mutex_unlock(&ctx->tx_lock);
 		break;
 	case TLS_TX_ZEROCOPY_RO:
 		lock_sock(sk);
