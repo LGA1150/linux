@@ -24,6 +24,7 @@
 #include "../kselftest_harness.h"
 
 #define TLS_PAYLOAD_MAX_LEN 16384
+#define TLS_HDR_LEN 5
 #define SOL_TLS 282
 
 static int fips_enabled;
@@ -2776,22 +2777,51 @@ TEST_F(tls_err, bad_rec)
 	EXPECT_EQ(errno, EAGAIN);
 }
 
+/* cfd carries a byte stream, so one recv() can return part of a
+ * record. Take the fragment length from the record header and wait
+ * for the remainder.
+ */
+static void tls_send_record(struct __test_metadata *_metadata,
+			    int fd, int cfd, int fd2, const void *txt,
+			    size_t txt_len, bool bad_auth)
+{
+	char buf[128];
+	int len;
+
+	ASSERT_EQ(send(fd, txt, txt_len, 0), txt_len);
+
+	ASSERT_EQ(recv(cfd, buf, TLS_HDR_LEN, MSG_WAITALL), TLS_HDR_LEN);
+
+	len = ((unsigned char)buf[3] << 8) | (unsigned char)buf[4];
+	ASSERT_GT(len, 0);
+	ASSERT_LE(len, (int)sizeof(buf) - TLS_HDR_LEN);
+
+	ASSERT_EQ(recv(cfd, buf + TLS_HDR_LEN, len, MSG_WAITALL), len);
+
+	if (bad_auth)
+		buf[TLS_HDR_LEN + len - 1]++;
+
+	ASSERT_EQ(send(fd2, buf, TLS_HDR_LEN + len, 0), TLS_HDR_LEN + len);
+}
+
+static void tls_send_bad_auth(struct __test_metadata *_metadata,
+			      int fd, int cfd, int fd2)
+{
+	char txt[64];
+
+	memrnd(txt, sizeof(txt));
+	tls_send_record(_metadata, fd, cfd, fd2, txt, sizeof(txt), true);
+}
+
 TEST_F(tls_err, bad_auth)
 {
 	char buf[128];
-	int n;
 
 	if (self->notls)
 		SKIP(return, "no TLS support");
 
-	memrnd(buf, sizeof(buf) / 2);
-	EXPECT_EQ(send(self->fd, buf, sizeof(buf) / 2, 0), sizeof(buf) / 2);
-	n = recv(self->cfd, buf, sizeof(buf), 0);
-	EXPECT_GT(n, sizeof(buf) / 2);
+	tls_send_bad_auth(_metadata, self->fd, self->cfd, self->fd2);
 
-	buf[n - 1]++;
-
-	EXPECT_EQ(send(self->fd2, buf, n, 0), n);
 	EXPECT_EQ(recv(self->cfd2, buf, sizeof(buf), 0), -1);
 	EXPECT_EQ(errno, EBADMSG);
 	EXPECT_EQ(recv(self->cfd2, buf, sizeof(buf), 0), -1);
@@ -2801,9 +2831,8 @@ TEST_F(tls_err, bad_auth)
 TEST_F(tls_err, bad_in_large_read)
 {
 	char txt[3][64];
-	char cip[3][128];
 	char buf[3 * 128];
-	int i, n;
+	int i;
 
 	if (self->notls)
 		SKIP(return, "no TLS support");
@@ -2811,25 +2840,109 @@ TEST_F(tls_err, bad_in_large_read)
 	/* Put 3 records in the sockets */
 	for (i = 0; i < 3; i++) {
 		memrnd(txt[i], sizeof(txt[i]));
-		EXPECT_EQ(send(self->fd, txt[i], sizeof(txt[i]), 0),
-			  sizeof(txt[i]));
-		n = recv(self->cfd, cip[i], sizeof(cip[i]), 0);
-		EXPECT_GT(n, sizeof(txt[i]));
 		/* Break the third message */
-		if (i == 2)
-			cip[2][n - 1]++;
-		EXPECT_EQ(send(self->fd2, cip[i], n, 0), n);
+		tls_send_record(_metadata, self->fd, self->cfd, self->fd2,
+				txt[i], sizeof(txt[i]), i == 2);
 	}
 
 	/* We should be able to receive the first two messages */
 	EXPECT_EQ(recv(self->cfd2, buf, sizeof(buf), 0), sizeof(txt[0]) * 2);
 	EXPECT_EQ(memcmp(buf, txt[0], sizeof(txt[0])), 0);
 	EXPECT_EQ(memcmp(buf + sizeof(txt[0]), txt[1], sizeof(txt[1])), 0);
-	/* Third mesasge is bad */
+	/* Third message is bad */
 	EXPECT_EQ(recv(self->cfd2, buf, sizeof(buf), 0), -1);
 	EXPECT_EQ(errno, EBADMSG);
 	EXPECT_EQ(recv(self->cfd2, buf, sizeof(buf), 0), -1);
 	EXPECT_EQ(errno, EBADMSG);
+}
+
+TEST_F(tls_err, bad_in_middle_read)
+{
+	char txt[4][64];
+	char buf[sizeof(txt)];
+	int i;
+
+	if (self->notls)
+		SKIP(return, "no TLS support");
+
+	/* Later successes must not hide the first failure. */
+	memrnd(txt, sizeof(txt));
+	for (i = 0; i < 4; i++)
+		tls_send_record(_metadata, self->fd, self->cfd, self->fd2,
+				txt[i], sizeof(txt[i]), i == 1 || i == 3);
+
+	ASSERT_EQ(recv(self->cfd2, buf, sizeof(buf), MSG_WAITALL), sizeof(txt[0]));
+	EXPECT_EQ(memcmp(buf, txt[0], sizeof(txt[0])), 0);
+	EXPECT_EQ(recv(self->cfd2, buf, sizeof(buf), 0), -1);
+	EXPECT_EQ(errno, EBADMSG);
+	EXPECT_EQ(recv(self->cfd2, buf, sizeof(buf), MSG_DONTWAIT), -1);
+	EXPECT_EQ(errno, EBADMSG);
+}
+
+TEST_F(tls_err, bad_in_partial_read)
+{
+	char txt[3][64];
+	char buf[sizeof(txt) - 32];
+	int i;
+
+	if (self->notls)
+		SKIP(return, "no TLS support");
+
+	memrnd(txt, sizeof(txt));
+	for (i = 0; i < 3; i++)
+		tls_send_record(_metadata, self->fd, self->cfd, self->fd2,
+				txt[i], sizeof(txt[i]), i == 2);
+
+	/* The bad record does not fit the remaining receive buffer. */
+	ASSERT_EQ(recv(self->cfd2, buf, sizeof(buf), MSG_WAITALL), 128);
+	EXPECT_EQ(memcmp(buf, txt, 128), 0);
+	EXPECT_EQ(recv(self->cfd2, buf, sizeof(buf), 0), -1);
+	EXPECT_EQ(errno, EBADMSG);
+	EXPECT_EQ(recv(self->cfd2, buf, sizeof(buf), MSG_DONTWAIT), -1);
+	EXPECT_EQ(errno, EBADMSG);
+}
+
+TEST_F(tls_err, bad_in_peek)
+{
+	char txt[4][64];
+	char buf[sizeof(txt)];
+	int i, p[2];
+
+	if (self->notls)
+		SKIP(return, "no TLS support");
+
+	memrnd(txt, sizeof(txt));
+	for (i = 0; i < 4; i++)
+		tls_send_record(_metadata, self->fd, self->cfd, self->fd2,
+				txt[i], sizeof(txt[i]), i == 2);
+
+	/* Start the next peek with a record already buffered on rx_list. */
+	ASSERT_EQ(recv(self->cfd2, buf, 32, MSG_PEEK | MSG_WAITALL), 32);
+	EXPECT_EQ(memcmp(buf, txt[0], 32), 0);
+
+	for (i = 0; i < 2; i++) {
+		ASSERT_EQ(recv(self->cfd2, buf, sizeof(buf), MSG_PEEK | MSG_WAITALL), 128);
+		EXPECT_EQ(memcmp(buf, txt, 128), 0);
+	}
+
+	ASSERT_EQ(recv(self->cfd2, buf, 32, 0), 32);
+	EXPECT_EQ(memcmp(buf, txt[0], 32), 0);
+
+	/* The unconsumed authenticated prefix remains available to splice. */
+	ASSERT_EQ(pipe(p), 0);
+	ASSERT_EQ(splice(self->cfd2, NULL, p[1], NULL, sizeof(buf), 0), 32);
+	ASSERT_EQ(read(p[0], buf, sizeof(buf)), 32);
+	EXPECT_EQ(memcmp(buf, txt[0] + 32, 32), 0);
+	ASSERT_EQ(splice(self->cfd2, NULL, p[1], NULL, sizeof(buf), 0), 64);
+	ASSERT_EQ(read(p[0], buf, sizeof(buf)), 64);
+	EXPECT_EQ(memcmp(buf, txt[1], 64), 0);
+
+	EXPECT_EQ(recv(self->cfd2, buf, sizeof(buf), MSG_DONTWAIT), -1);
+	EXPECT_EQ(errno, EBADMSG);
+	EXPECT_EQ(splice(self->cfd2, NULL, p[1], NULL, sizeof(buf), SPLICE_F_NONBLOCK), -1);
+	EXPECT_EQ(errno, EBADMSG);
+	close(p[0]);
+	close(p[1]);
 }
 
 TEST_F(tls_err, bad_cmsg)
