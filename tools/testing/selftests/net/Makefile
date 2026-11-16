@@ -177,6 +177,7 @@ TEST_GEN_FILES := \
 	tcp_mmap \
 	tfo \
 	timestamping \
+	tls_rx_bench \
 	txring_overwrite \
 	txtimestamp \
 	udpgso \

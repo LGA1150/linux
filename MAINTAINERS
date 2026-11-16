@@ -19805,6 +19805,7 @@ F:	include/uapi/linux/tls.h
 F:	net/tls/
 F:	tools/testing/selftests/drivers/net/hw/tls*
 F:	tools/testing/selftests/net/tls.c
+F:	tools/testing/selftests/net/tls_rx_bench.c
 
 NETWORKING [SOCKETS]
 M:	Eric Dumazet <edumazet@kernel.org>
