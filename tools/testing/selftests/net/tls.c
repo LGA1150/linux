@@ -696,6 +696,37 @@ TEST_F(tls, sendmsg_large)
 	free(mem);
 }
 
+TEST_F(tls, send_pipeline)
+{
+	char sent[8 * TLS_PAYLOAD_MAX_LEN], received[sizeof(sent)];
+
+	memrnd(sent, sizeof(sent));
+	/* A single send must keep several full records in flight. */
+	ASSERT_EQ(send(self->fd, sent, sizeof(sent), 0), sizeof(sent));
+	ASSERT_EQ(recv(self->cfd, received, sizeof(received), MSG_WAITALL),
+		  sizeof(received));
+	EXPECT_EQ(memcmp(sent, received, sizeof(sent)), 0);
+}
+
+TEST_F(tls, send_more_pipeline)
+{
+	char sent[8][TLS_PAYLOAD_MAX_LEN], received[sizeof(sent)];
+	char buf[TLS_PAYLOAD_MAX_LEN];
+	int i;
+
+	memrnd(sent, sizeof(sent));
+	for (i = 0; i < 8; i++) {
+		memcpy(buf, sent[i], sizeof(buf));
+		ASSERT_EQ(send(self->fd, buf, sizeof(buf), i == 7 ? 0 : MSG_MORE),
+			  sizeof(buf));
+		/* The caller can reuse its buffer before the next send. */
+		memset(buf, 0, sizeof(buf));
+	}
+	ASSERT_EQ(recv(self->cfd, received, sizeof(received), MSG_WAITALL),
+		  sizeof(received));
+	EXPECT_EQ(memcmp(sent, received, sizeof(sent)), 0);
+}
+
 TEST_F(tls, sendmsg_multiple)
 {
 	char const *test_str = "test_sendmsg_multiple";
@@ -812,6 +843,79 @@ TEST_F(tls, splice_from_pipe2)
 	EXPECT_EQ(splice(p2[0], NULL, self->fd, NULL, 8000, 0), 8000);
 	EXPECT_EQ(recv(self->cfd, mem_recv, send_len, MSG_WAITALL), send_len);
 	EXPECT_EQ(memcmp(mem_send, mem_recv, send_len), 0);
+}
+
+TEST_F(tls, splice_send_pipeline)
+{
+	char sent[4 * TLS_PAYLOAD_MAX_LEN], received[sizeof(sent)];
+	int p[2];
+
+	memrnd(sent, sizeof(sent));
+	ASSERT_GE(pipe(p), 0);
+	ASSERT_GE(fcntl(p[1], F_SETPIPE_SZ, sizeof(sent)), sizeof(sent));
+	ASSERT_EQ(write(p[1], sent, sizeof(sent)), sizeof(sent));
+	ASSERT_EQ(splice(p[0], NULL, self->fd, NULL, sizeof(sent), 0), sizeof(sent));
+	close(p[0]);
+	close(p[1]);
+	ASSERT_EQ(recv(self->cfd, received, sizeof(received), MSG_WAITALL),
+		  sizeof(received));
+	EXPECT_EQ(memcmp(sent, received, sizeof(sent)), 0);
+}
+
+TEST_F(tls, splice_send_more_pipeline)
+{
+	char sent[8][TLS_PAYLOAD_MAX_LEN], received[sizeof(sent)];
+	int p[2], i;
+
+	memrnd(sent, sizeof(sent));
+	ASSERT_GE(pipe(p), 0);
+	/* Retain input pages across calls until crypto completes, even when
+	 * the pipe is reused and closed before receiving the data.
+	 */
+	for (i = 0; i < 8; i++) {
+		ASSERT_EQ(write(p[1], sent[i], sizeof(sent[i])), sizeof(sent[i]));
+		ASSERT_EQ(splice(p[0], NULL, self->fd, NULL, sizeof(sent[i]),
+				 i == 7 ? 0 : SPLICE_F_MORE),
+			  sizeof(sent[i]));
+	}
+	close(p[0]);
+	close(p[1]);
+	ASSERT_EQ(recv(self->cfd, received, sizeof(received), MSG_WAITALL),
+		  sizeof(received));
+	EXPECT_EQ(memcmp(sent, received, sizeof(sent)), 0);
+}
+
+TEST_F(tls, splice_recv_pipeline)
+{
+	char sent[12][128], received[sizeof(sent)];
+	int p[2], i, off = 64;
+	ssize_t ret;
+
+	memrnd(sent, sizeof(sent));
+	ASSERT_GE(pipe(p), 0);
+	for (i = 0; i < 12; i++)
+		ASSERT_EQ(send(self->fd, sent[i], sizeof(sent[i]), 0), sizeof(sent[i]));
+
+	/* Leave both a partial plaintext record and prefetched ciphertext,
+	 * then switch reader APIs without losing or re-decrypting records.
+	 */
+	ASSERT_EQ(splice(self->cfd, NULL, p[1], NULL, 64, 0), 64);
+	ASSERT_EQ(read(p[0], received, 64), 64);
+	ASSERT_EQ(recv(self->cfd, received + off, 192, MSG_PEEK | MSG_WAITALL), 192);
+	EXPECT_EQ(memcmp(received, sent, off + 192), 0);
+	ASSERT_EQ(recv(self->cfd, received + off, 192, MSG_WAITALL), 192);
+	off += 192;
+	while (off < sizeof(sent)) {
+		ret = splice(self->cfd, NULL, p[1], NULL, sizeof(sent) - off, 0);
+		ASSERT_GT(ret, 0);
+		ASSERT_EQ(read(p[0], received + off, ret), ret);
+		off += ret;
+	}
+	EXPECT_EQ(memcmp(sent, received, sizeof(sent)), 0);
+	EXPECT_EQ(recv(self->cfd, received, 1, MSG_DONTWAIT), -1);
+	EXPECT_EQ(errno, EAGAIN);
+	close(p[0]);
+	close(p[1]);
 }
 
 TEST_F(tls, send_and_splice)
@@ -3102,6 +3206,31 @@ TEST_F(tls_err, bad_in_partial_read)
 	EXPECT_EQ(errno, EBADMSG);
 	EXPECT_EQ(recv(self->cfd2, buf, sizeof(buf), MSG_DONTWAIT), -1);
 	EXPECT_EQ(errno, EBADMSG);
+}
+
+TEST_F(tls_err, bad_in_splice)
+{
+	char sent[3][64], received[sizeof(sent)];
+	int p[2], i;
+
+	if (self->notls)
+		SKIP(return, "no TLS support");
+
+	memrnd(sent, sizeof(sent));
+	ASSERT_GE(pipe(p), 0);
+	for (i = 0; i < 3; i++)
+		tls_send_record(_metadata, self->fd, self->cfd, self->fd2,
+				sent[i], sizeof(sent[i]), i == 1);
+
+	ASSERT_EQ(splice(self->cfd2, NULL, p[1], NULL, sizeof(received), 0), 64);
+	ASSERT_EQ(read(p[0], received, 64), 64);
+	EXPECT_EQ(memcmp(received, sent[0], 64), 0);
+	EXPECT_EQ(splice(self->cfd2, NULL, p[1], NULL, sizeof(received), 0), -1);
+	EXPECT_EQ(errno, EBADMSG);
+	EXPECT_EQ(recv(self->cfd2, received, sizeof(received), MSG_DONTWAIT), -1);
+	EXPECT_EQ(errno, EBADMSG);
+	close(p[0]);
+	close(p[1]);
 }
 
 TEST_F(tls_err, bad_in_peek)

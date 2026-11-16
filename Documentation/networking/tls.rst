@@ -202,6 +202,24 @@ received without a cmsg buffer set.
 
 recv will never return data from mixed types of TLS records.
 
+Asynchronous crypto
+-------------------
+
+Software TLS can keep multiple crypto requests in flight with an asynchronous
+cipher, for both TLS 1.2 and TLS 1.3. Transmit pipelines full records within a
+large send() or pipe-to-socket splice(). MSG_MORE and SPLICE_F_MORE also allow
+full records to remain in flight across calls. The final call without these
+flags waits for its encryptions; a call that borrows userspace pages always
+waits before returning so that the application can reuse its buffer.
+
+Receive pipelines records for both recv() and socket-to-pipe splice(). TLS 1.2
+recv() retains its direct-to-userspace decryption path. TLS 1.3 and splice()
+use kernel buffers, collecting up to eight records already available on the
+socket without waiting to fill a batch. Plaintext and authentication errors
+are processed in wire order. A splice() call can still return less than the
+requested length, including only one record, even when later records have
+already been decrypted.
+
 TLS 1.3 Key Updates
 -------------------
 
