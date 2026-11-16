@@ -2147,6 +2147,37 @@ TEST_F(tls, rekey_queued_records)
 	EXPECT_EQ(errno, EAGAIN);
 }
 
+TEST_F(tls, rekey_send_pending)
+{
+	char sent[4 * TLS_PAYLOAD_MAX_LEN + 13], received[sizeof(sent)];
+	struct tls_crypto_info_keys key;
+	char warmup = 1;
+
+	if (variant->tls_version != TLS_1_3_VERSION)
+		return;
+	if (self->notls)
+		SKIP(return, "no TLS support");
+
+	/* Discover an asynchronous TX cipher before the MSG_MORE call. */
+	ASSERT_EQ(send(self->fd, &warmup, 1, 0), 1);
+	ASSERT_EQ(recv(self->cfd, received, 1, MSG_WAITALL), 1);
+	memrnd(sent, sizeof(sent));
+	ASSERT_EQ(send(self->fd, sent, sizeof(sent), MSG_MORE), sizeof(sent));
+
+	/* Rekey with full records in flight and a partial record still open.
+	 * All accepted plaintext must be encrypted with the original key.
+	 */
+	tls_crypto_info_init(variant->tls_version, variant->cipher_type, &key, 1);
+	ASSERT_EQ(setsockopt(self->fd, SOL_TLS, TLS_TX, &key, key.len), 0);
+	ASSERT_EQ(send(self->fd, &warmup, 1, 0), 1);
+	ASSERT_EQ(recv(self->cfd, received, sizeof(received), MSG_WAITALL),
+		  sizeof(received));
+	EXPECT_EQ(memcmp(sent, received, sizeof(sent)), 0);
+	ASSERT_EQ(setsockopt(self->cfd, SOL_TLS, TLS_RX, &key, key.len), 0);
+	ASSERT_EQ(recv(self->cfd, received, 1, MSG_WAITALL), 1);
+	EXPECT_EQ(received[0], warmup);
+}
+
 TEST_F(tls, rekey_fail)
 {
 	char const *test_str_1 = "test_message_before_rekey";

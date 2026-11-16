@@ -2880,6 +2880,17 @@ int tls_set_sw_offload(struct sock *sk, int tx,
 		crypto_info = &ctx->crypto_send.info;
 		cctx = &ctx->tx;
 		aead = &sw_ctx_tx->aead_send;
+		if (new_crypto_info) {
+			/* Finish using the old key before changing the shared
+			 * transform. Ciphertext can remain queued for TCP.
+			 */
+			rc = tls_sw_push_pending_record(sk, 0);
+			if (rc && rc != -EINPROGRESS && rc != -EAGAIN)
+				goto out;
+			rc = tls_encrypt_async_wait(sw_ctx_tx);
+			if (rc)
+				goto out;
+		}
 	} else {
 		sw_ctx_rx = ctx->priv_ctx_rx;
 		crypto_info = &ctx->crypto_recv.info;
