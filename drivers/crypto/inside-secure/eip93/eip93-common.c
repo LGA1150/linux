@@ -627,7 +627,7 @@ int eip93_send_req(struct crypto_async_request *async,
 
 			rctx->sa_state_ctr_base = dma_map_single(eip93->dev, rctx->sa_state_ctr,
 								 sizeof(*rctx->sa_state_ctr),
-								 DMA_TO_DEVICE);
+								 DMA_BIDIRECTIONAL);
 			if (dma_mapping_error(eip93->dev, rctx->sa_state_ctr_base)) {
 				err = -ENOMEM;
 				goto free_sa_state_ctr;
@@ -636,7 +636,7 @@ int eip93_send_req(struct crypto_async_request *async,
 	}
 
 	rctx->sa_state_base = dma_map_single(eip93->dev, rctx->sa_state,
-					     sizeof(*rctx->sa_state), DMA_TO_DEVICE);
+					     sizeof(*rctx->sa_state), DMA_BIDIRECTIONAL);
 	if (dma_mapping_error(eip93->dev, rctx->sa_state_base)) {
 		err = -ENOMEM;
 		goto unmap_sa_state_ctr;
@@ -675,11 +675,11 @@ unmap_sg_dst:
 unmap_sa_state:
 	if (rctx->sa_state)
 		dma_unmap_single(eip93->dev, rctx->sa_state_base,
-				 sizeof(*rctx->sa_state), DMA_TO_DEVICE);
+				 sizeof(*rctx->sa_state), DMA_BIDIRECTIONAL);
 unmap_sa_state_ctr:
 	if (rctx->sa_state_ctr)
 		dma_unmap_single(eip93->dev, rctx->sa_state_ctr_base,
-				 sizeof(*rctx->sa_state_ctr), DMA_TO_DEVICE);
+				 sizeof(*rctx->sa_state_ctr), DMA_BIDIRECTIONAL);
 free_sa_state_ctr:
 	kfree(rctx->sa_state_ctr);
 free_sa_state:
@@ -753,12 +753,12 @@ void eip93_handle_result(struct eip93_device *eip93, struct eip93_cipher_reqctx 
 	if (rctx->sa_state_ctr)
 		dma_unmap_single(eip93->dev, rctx->sa_state_ctr_base,
 				 sizeof(*rctx->sa_state_ctr),
-				 DMA_FROM_DEVICE);
+				 DMA_BIDIRECTIONAL);
 
 	if (rctx->sa_state)
 		dma_unmap_single(eip93->dev, rctx->sa_state_base,
 				 sizeof(*rctx->sa_state),
-				 DMA_FROM_DEVICE);
+				 DMA_BIDIRECTIONAL);
 
 	if (!IS_ECB(rctx->flags))
 		memcpy(reqiv, rctx->sa_state->state_iv, rctx->ivsize);
