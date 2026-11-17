@@ -238,8 +238,6 @@ static int eip93_send_hash_req(struct crypto_async_request *async, u8 *data,
 	cdesc.user_id |= FIELD_PREP(EIP93_PE_USER_ID_DESC_FLAGS, EIP93_DESC_HASH);
 
 	if (last) {
-		int crypto_async_idr;
-
 		if (rctx->finalize && !rctx->partial_hash) {
 			/* For last block, pass sa_record with CMD_HMAC enabled */
 			if (IS_HMAC(ctx->flags)) {
@@ -259,11 +257,7 @@ static int eip93_send_hash_req(struct crypto_async_request *async, u8 *data,
 			cdesc.pe_ctrl_stat_word |= EIP93_PE_CTRL_PE_HASH_FINAL;
 		}
 
-		scoped_guard(spinlock_bh, &eip93->ring->idr_lock)
-			crypto_async_idr = idr_alloc(&eip93->ring->crypto_async_idr, async, 0,
-						     EIP93_RING_NUM - 1, GFP_ATOMIC);
-
-		cdesc.user_id |= FIELD_PREP(EIP93_PE_USER_ID_CRYPTO_IDR, (u16)crypto_async_idr) |
+		cdesc.user_id |= FIELD_PREP(EIP93_PE_USER_ID_CRYPTO_IDR, rctx->request_id) |
 				 FIELD_PREP(EIP93_PE_USER_ID_DESC_FLAGS, EIP93_DESC_LAST);
 	}
 
@@ -394,17 +388,22 @@ static int eip93_hash_update(struct ahash_request *req)
 	struct sa_record *sa_record = &rctx->sa_record;
 	struct sa_state *sa_state = &rctx->sa_state;
 	struct eip93_device *eip93 = ctx->eip93;
-	int ret;
+	int ret, request_id;
 
 	if (!req->nbytes)
 		return 0;
+
+	request_id = eip93_alloc_req_id(eip93, &req->base);
+	if (request_id < 0)
+		return request_id;
+	rctx->request_id = request_id;
 
 	rctx->sa_state_base = dma_map_single(eip93->dev, sa_state,
 					     sizeof(*sa_state),
 					     DMA_TO_DEVICE);
 	ret = dma_mapping_error(eip93->dev, rctx->sa_state_base);
 	if (ret)
-		return ret;
+		goto free_request_id;
 
 	rctx->sa_record_base = dma_map_single(eip93->dev, sa_record,
 					      sizeof(*sa_record),
@@ -416,8 +415,9 @@ static int eip93_hash_update(struct ahash_request *req)
 	ret = __eip93_hash_update(req, true);
 	if (ret && ret != -EINPROGRESS)
 		goto free_sa_record;
-
-	return ret;
+	if (ret == -EINPROGRESS)
+		return ret;
+	goto free_request_id;
 
 free_sa_record:
 	dma_unmap_single(eip93->dev, rctx->sa_record_base,
@@ -426,6 +426,9 @@ free_sa_record:
 free_sa_state:
 	dma_unmap_single(eip93->dev, rctx->sa_state_base,
 			 sizeof(*sa_state), DMA_TO_DEVICE);
+
+free_request_id:
+	eip93_free_req_id(eip93, request_id);
 
 	return ret;
 }
@@ -513,7 +516,24 @@ free_sa_state:
 
 static int eip93_hash_final(struct ahash_request *req)
 {
-	return __eip93_hash_final(req, true);
+	struct eip93_hash_reqctx *rctx = ahash_request_ctx_dma(req);
+	struct crypto_ahash *ahash = crypto_ahash_reqtfm(req);
+	struct eip93_hash_ctx *ctx = crypto_ahash_ctx(ahash);
+	int ret, request_id;
+
+	if (!rctx->len && !IS_HMAC(ctx->flags))
+		return __eip93_hash_final(req, true);
+
+	request_id = eip93_alloc_req_id(ctx->eip93, &req->base);
+	if (request_id < 0)
+		return request_id;
+	rctx->request_id = request_id;
+
+	ret = __eip93_hash_final(req, true);
+	if (ret != -EINPROGRESS)
+		eip93_free_req_id(ctx->eip93, request_id);
+
+	return ret;
 }
 
 static int eip93_hash_finup(struct ahash_request *req)
@@ -524,7 +544,16 @@ static int eip93_hash_finup(struct ahash_request *req)
 	struct sa_record *sa_record = &rctx->sa_record;
 	struct sa_state *sa_state = &rctx->sa_state;
 	struct eip93_device *eip93 = ctx->eip93;
-	int ret;
+	int ret, request_id;
+
+	if (!rctx->len && !req->nbytes && !IS_HMAC(ctx->flags))
+		return __eip93_hash_final(req, false);
+
+	/* The ID must exist before update submits any intermediate blocks. */
+	request_id = eip93_alloc_req_id(eip93, &req->base);
+	if (request_id < 0)
+		return request_id;
+	rctx->request_id = request_id;
 
 	if (rctx->len + req->nbytes || IS_HMAC(ctx->flags)) {
 		rctx->sa_state_base = dma_map_single(eip93->dev, sa_state,
@@ -532,7 +561,7 @@ static int eip93_hash_finup(struct ahash_request *req)
 						     DMA_TO_DEVICE);
 		ret = dma_mapping_error(eip93->dev, rctx->sa_state_base);
 		if (ret)
-			return ret;
+			goto free_request_id;
 
 		rctx->sa_record_base = dma_map_single(eip93->dev, sa_record,
 						      sizeof(*sa_record),
@@ -546,7 +575,10 @@ static int eip93_hash_finup(struct ahash_request *req)
 			goto free_sa_record;
 	}
 
-	return __eip93_hash_final(req, false);
+	ret = __eip93_hash_final(req, false);
+	if (ret == -EINPROGRESS)
+		return ret;
+	goto free_request_id;
 
 free_sa_record:
 	dma_unmap_single(eip93->dev, rctx->sa_record_base,
@@ -554,6 +586,9 @@ free_sa_record:
 free_sa_state:
 	dma_unmap_single(eip93->dev, rctx->sa_state_base,
 			 sizeof(*sa_state), DMA_TO_DEVICE);
+
+free_request_id:
+	eip93_free_req_id(eip93, request_id);
 
 	return ret;
 }

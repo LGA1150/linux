@@ -32,6 +32,7 @@ struct eip93_hash_reqctx {
 	dma_addr_t		sa_record_base;
 	dma_addr_t		sa_record_hmac_base;
 	dma_addr_t		sa_state_base;
+	int			request_id;
 
 	/* Don't enable HASH_FINALIZE when last block is sent */
 	bool			partial_hash;
