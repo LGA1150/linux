@@ -220,7 +220,7 @@ static bool eip93_is_sg_aligned(struct scatterlist *sg, u32 len,
 	return false;
 }
 
-int check_valid_request(struct eip93_cipher_reqctx *rctx)
+static int check_valid_request(struct eip93_cipher_reqctx *rctx)
 {
 	struct scatterlist *src = rctx->sg_src;
 	struct scatterlist *dst = rctx->sg_dst;
@@ -537,6 +537,7 @@ int eip93_send_req(struct crypto_async_request *async,
 	struct eip93_device *eip93 = ctx->eip93;
 	struct scatterlist *src = rctx->sg_src;
 	struct scatterlist *dst = rctx->sg_dst;
+	struct scatterlist *reqsrc = src, *reqdst = dst;
 	struct sa_state *sa_state;
 	struct eip93_descriptor cdesc;
 	u32 flags = rctx->flags;
@@ -549,14 +550,29 @@ int eip93_send_req(struct crypto_async_request *async,
 	rctx->sa_state_ctr = NULL;
 	rctx->sa_state = NULL;
 
+	err = check_valid_request(rctx);
+	if (err)
+		goto free_sg_copy;
+	src = rctx->sg_src;
+	dst = rctx->sg_dst;
+
+	rctx->sa_record_base = dma_map_single(eip93->dev, ctx->sa_record,
+					      sizeof(*ctx->sa_record), DMA_TO_DEVICE);
+	if (dma_mapping_error(eip93->dev, rctx->sa_record_base)) {
+		err = -ENOMEM;
+		goto free_sg_copy;
+	}
+
 	if (IS_ECB(flags))
 		goto skip_iv;
 
 	memcpy(iv, reqiv, rctx->ivsize);
 
 	rctx->sa_state = kzalloc_obj(*rctx->sa_state);
-	if (!rctx->sa_state)
-		return -ENOMEM;
+	if (!rctx->sa_state) {
+		err = -ENOMEM;
+		goto unmap_sa_record;
+	}
 
 	sa_state = rctx->sa_state;
 
@@ -594,17 +610,19 @@ int eip93_send_req(struct crypto_async_request *async,
 			rctx->sa_state_ctr_base = dma_map_single(eip93->dev, rctx->sa_state_ctr,
 								 sizeof(*rctx->sa_state_ctr),
 								 DMA_TO_DEVICE);
-			err = dma_mapping_error(eip93->dev, rctx->sa_state_ctr_base);
-			if (err)
+			if (dma_mapping_error(eip93->dev, rctx->sa_state_ctr_base)) {
+				err = -ENOMEM;
 				goto free_sa_state_ctr;
+			}
 		}
 	}
 
 	rctx->sa_state_base = dma_map_single(eip93->dev, rctx->sa_state,
 					     sizeof(*rctx->sa_state), DMA_TO_DEVICE);
-	err = dma_mapping_error(eip93->dev, rctx->sa_state_base);
-	if (err)
-		goto free_sa_state_ctr_dma;
+	if (dma_mapping_error(eip93->dev, rctx->sa_state_base)) {
+		err = -ENOMEM;
+		goto unmap_sa_state_ctr;
+	}
 
 skip_iv:
 
@@ -623,32 +641,40 @@ skip_iv:
 	 */
 	if (!dma_map_sg(eip93->dev, dst, rctx->dst_nents, DMA_BIDIRECTIONAL)) {
 		err = -ENOMEM;
-		goto free_sa_state_ctr_dma;
+		goto unmap_sa_state;
 	}
 
 	if (src != dst &&
 	    !dma_map_sg(eip93->dev, src, rctx->src_nents, DMA_TO_DEVICE)) {
 		err = -ENOMEM;
-		goto free_sg_dma;
+		goto unmap_sg_dst;
 	}
 
 	return eip93_scatter_combine(eip93, rctx, datalen, split, offsetin);
 
-free_sg_dma:
+unmap_sg_dst:
 	dma_unmap_sg(eip93->dev, dst, rctx->dst_nents, DMA_BIDIRECTIONAL);
-free_sa_state_ctr_dma:
-	if (rctx->sa_state_ctr)
-		dma_unmap_single(eip93->dev, rctx->sa_state_ctr_base,
-				 sizeof(*rctx->sa_state_ctr),
-				 DMA_TO_DEVICE);
-free_sa_state_ctr:
-	kfree(rctx->sa_state_ctr);
+unmap_sa_state:
 	if (rctx->sa_state)
 		dma_unmap_single(eip93->dev, rctx->sa_state_base,
-				 sizeof(*rctx->sa_state),
-				 DMA_TO_DEVICE);
+				 sizeof(*rctx->sa_state), DMA_TO_DEVICE);
+unmap_sa_state_ctr:
+	if (rctx->sa_state_ctr)
+		dma_unmap_single(eip93->dev, rctx->sa_state_ctr_base,
+				 sizeof(*rctx->sa_state_ctr), DMA_TO_DEVICE);
+free_sa_state_ctr:
+	kfree(rctx->sa_state_ctr);
 free_sa_state:
 	kfree(rctx->sa_state);
+unmap_sa_record:
+	dma_unmap_single(eip93->dev, rctx->sa_record_base,
+			 sizeof(*ctx->sa_record), DMA_TO_DEVICE);
+free_sg_copy:
+	/* No descriptor was submitted: discard bounce buffers without copyback. */
+	if (rctx->sg_src != reqsrc)
+		eip93_free_sg_copy(datalen + rctx->authsize, &rctx->sg_src);
+	if (rctx->sg_dst != reqdst)
+		eip93_free_sg_copy(datalen + rctx->authsize, &rctx->sg_dst);
 
 	return err;
 }
@@ -700,6 +726,9 @@ process_tag:
 void eip93_handle_result(struct eip93_device *eip93, struct eip93_cipher_reqctx *rctx,
 			 u8 *reqiv)
 {
+	dma_unmap_single(eip93->dev, rctx->sa_record_base,
+			 sizeof(struct sa_record), DMA_TO_DEVICE);
+
 	if (rctx->sa_state_ctr)
 		dma_unmap_single(eip93->dev, rctx->sa_state_ctr_base,
 				 sizeof(*rctx->sa_state_ctr),

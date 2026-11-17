@@ -16,7 +16,6 @@ struct eip93_crypto_ctx {
 	struct sa_record		*sa_record;
 	u32				sa_nonce;
 	int				blksize;
-	dma_addr_t			sa_record_base;
 	/* AEAD specific */
 	unsigned int			authsize;
 	unsigned int			assoclen;
@@ -44,8 +43,6 @@ struct eip93_cipher_reqctx {
 	struct sa_state			*sa_state_ctr;
 	dma_addr_t			sa_state_ctr_base;
 };
-
-int check_valid_request(struct eip93_cipher_reqctx *rctx);
 
 void eip93_unmap_dma(struct eip93_device *eip93, struct eip93_cipher_reqctx *rctx,
 		     struct scatterlist *reqsrc, struct scatterlist *reqdst);

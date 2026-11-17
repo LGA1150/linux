@@ -40,21 +40,6 @@ void eip93_aead_handle_result(struct crypto_async_request *async, int err)
 	aead_request_complete(req, err);
 }
 
-static int eip93_aead_send_req(struct crypto_async_request *async)
-{
-	struct aead_request *req = aead_request_cast(async);
-	struct eip93_cipher_reqctx *rctx = aead_request_ctx(req);
-	int err;
-
-	err = check_valid_request(rctx);
-	if (err) {
-		aead_request_complete(req, err);
-		return err;
-	}
-
-	return eip93_send_req(async, req->iv, rctx);
-}
-
 /* Crypto aead API functions */
 static int eip93_aead_cra_init(struct crypto_tfm *tfm)
 {
@@ -81,8 +66,6 @@ static void eip93_aead_cra_exit(struct crypto_tfm *tfm)
 {
 	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(tfm);
 
-	dma_unmap_single(ctx->eip93->dev, ctx->sa_record_base,
-			 sizeof(*ctx->sa_record), DMA_TO_DEVICE);
 	kfree(ctx->sa_record);
 }
 
@@ -197,12 +180,6 @@ static int eip93_aead_crypt(struct aead_request *req)
 		return request_id;
 	rctx->request_id = request_id;
 
-	ctx->sa_record_base = dma_map_single(ctx->eip93->dev, ctx->sa_record,
-					     sizeof(*ctx->sa_record), DMA_TO_DEVICE);
-	ret = dma_mapping_error(ctx->eip93->dev, ctx->sa_record_base);
-	if (ret)
-		goto free_request_id;
-
 	rctx->textsize = req->cryptlen;
 	rctx->blksize = ctx->blksize;
 	rctx->assoclen = req->assoclen;
@@ -211,16 +188,14 @@ static int eip93_aead_crypt(struct aead_request *req)
 	rctx->sg_dst = req->dst;
 	rctx->ivsize = crypto_aead_ivsize(aead);
 	rctx->desc_flags = EIP93_DESC_AEAD;
-	rctx->sa_record_base = ctx->sa_record_base;
 
 	if (IS_DECRYPT(rctx->flags))
 		rctx->textsize -= rctx->authsize;
 
-	ret = eip93_aead_send_req(async);
+	ret = eip93_send_req(async, req->iv, rctx);
 	if (ret == -EINPROGRESS)
 		return ret;
 
-free_request_id:
 	eip93_free_req_id(eip93, request_id);
 	return ret;
 }
