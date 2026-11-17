@@ -10,7 +10,6 @@
 #include <crypto/md5.h>
 #include <crypto/hmac.h>
 #include <linux/dma-mapping.h>
-#include <linux/delay.h>
 
 #include "eip93-cipher.h"
 #include "eip93-hash.h"
@@ -272,21 +271,6 @@ static int eip93_prepare_hash_req(struct crypto_async_request *async, u8 *data,
 	return 0;
 }
 
-static void eip93_send_hash_req(struct eip93_device *eip93,
-				struct eip93_descriptor *cdesc)
-{
-	int ret;
-
-again:
-	ret = eip93_put_descriptor(eip93, cdesc);
-	if (ret) {
-		usleep_range(EIP93_RING_BUSY_DELAY,
-			     EIP93_RING_BUSY_DELAY * 2);
-		goto again;
-	}
-
-}
-
 static int eip93_hash_init(struct ahash_request *req)
 {
 	struct eip93_hash_reqctx *rctx = ahash_request_ctx_dma(req);
@@ -339,7 +323,7 @@ static int __eip93_hash_update(struct ahash_request *req, bool complete_req)
 	 * and then reset to SHA256_BLOCK_SIZE.
 	 */
 	while (to_consume > max_read) {
-		block = kzalloc_obj(*block, GFP_ATOMIC);
+		block = kzalloc_obj(*block);
 		if (!block) {
 			ret = -ENOMEM;
 			goto free_blocks;
@@ -389,7 +373,7 @@ static int __eip93_hash_update(struct ahash_request *req, bool complete_req)
 	if (complete_req) {
 		list_for_each_entry_reverse(block, &rctx->blocks, list) {
 			wait_req = list_is_first(&block->list, &rctx->blocks);
-			eip93_send_hash_req(ctx->eip93, &block->desc);
+			eip93_put_descriptor(ctx->eip93, &block->desc);
 			/* Completion may free the list immediately after submission. */
 			if (wait_req)
 				return -EINPROGRESS;
@@ -404,7 +388,7 @@ free_blocks:
 	return ret;
 }
 
-static int eip93_hash_update(struct ahash_request *req)
+static int eip93_hash_do_update(struct ahash_request *req)
 {
 	struct eip93_hash_reqctx *rctx = ahash_request_ctx_dma(req);
 	struct crypto_ahash *ahash = crypto_ahash_reqtfm(req);
@@ -526,8 +510,8 @@ static int __eip93_hash_final(struct ahash_request *req, bool map_dma)
 		goto free_blocks;
 
 	list_for_each_entry_reverse(block, &rctx->blocks, list)
-		eip93_send_hash_req(eip93, &block->desc);
-	eip93_send_hash_req(eip93, &rctx->desc);
+		eip93_put_descriptor(eip93, &block->desc);
+	eip93_put_descriptor(eip93, &rctx->desc);
 
 	return -EINPROGRESS;
 
@@ -544,7 +528,7 @@ free_sa_state:
 	return ret;
 }
 
-static int eip93_hash_final(struct ahash_request *req)
+static int eip93_hash_do_final(struct ahash_request *req)
 {
 	struct eip93_hash_reqctx *rctx = ahash_request_ctx_dma(req);
 	struct crypto_ahash *ahash = crypto_ahash_reqtfm(req);
@@ -566,7 +550,7 @@ static int eip93_hash_final(struct ahash_request *req)
 	return ret;
 }
 
-static int eip93_hash_finup(struct ahash_request *req)
+static int eip93_hash_do_finup(struct ahash_request *req)
 {
 	struct eip93_hash_reqctx *rctx = ahash_request_ctx_dma(req);
 	struct crypto_ahash *ahash = crypto_ahash_reqtfm(req);
@@ -623,6 +607,50 @@ free_request_id:
 	eip93_free_req_id(eip93, request_id);
 
 	return ret;
+}
+
+int eip93_hash_submit(struct crypto_async_request *async)
+{
+	struct ahash_request *req = ahash_request_cast(async);
+	struct eip93_hash_reqctx *rctx = ahash_request_ctx_dma(req);
+
+	switch (rctx->op) {
+	case EIP93_HASH_UPDATE:
+		return eip93_hash_do_update(req);
+	case EIP93_HASH_FINAL:
+		return eip93_hash_do_final(req);
+	case EIP93_HASH_FINUP:
+		return eip93_hash_do_finup(req);
+	}
+
+	return -EINVAL;
+}
+
+static int eip93_hash_enqueue(struct ahash_request *req, enum eip93_hash_op op)
+{
+	struct eip93_hash_reqctx *rctx = ahash_request_ctx_dma(req);
+	struct eip93_hash_ctx *ctx = crypto_ahash_ctx(crypto_ahash_reqtfm(req));
+
+	rctx->op = op;
+	return eip93_enqueue(ctx->eip93, &req->base);
+}
+
+static int eip93_hash_update(struct ahash_request *req)
+{
+	if (!req->nbytes)
+		return 0;
+
+	return eip93_hash_enqueue(req, EIP93_HASH_UPDATE);
+}
+
+static int eip93_hash_final(struct ahash_request *req)
+{
+	return eip93_hash_enqueue(req, EIP93_HASH_FINAL);
+}
+
+static int eip93_hash_finup(struct ahash_request *req)
+{
+	return eip93_hash_enqueue(req, EIP93_HASH_FINUP);
 }
 
 static int eip93_hash_hmac_setkey(struct crypto_ahash *ahash, const u8 *key,

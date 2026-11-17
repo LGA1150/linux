@@ -8,13 +8,15 @@
 #ifndef _EIP93_MAIN_H_
 #define _EIP93_MAIN_H_
 
+#include <crypto/algapi.h>
 #include <crypto/internal/aead.h>
 #include <crypto/internal/hash.h>
 #include <crypto/internal/skcipher.h>
 #include <linux/bitfield.h>
 #include <linux/interrupt.h>
-
-#define EIP93_RING_BUSY_DELAY		500
+#include <linux/semaphore.h>
+#include <linux/wait.h>
+#include <linux/workqueue.h>
 
 #define EIP93_RING_NUM			512
 #define EIP93_RING_BUSY			32
@@ -118,6 +120,9 @@ struct eip93_ring {
 	/* aync idr */
 	spinlock_t			idr_lock;
 	struct idr			crypto_async_idr;
+	struct semaphore		requests;
+	struct semaphore		slots;
+	wait_queue_head_t		idle;
 };
 
 /**
@@ -128,6 +133,12 @@ struct eip93_device {
 	struct device		*dev;
 	struct clk		*clk;
 	int			irq;
+	struct crypto_queue	queue;
+	/* Protect queue membership, backlog promotion and shutdown. */
+	spinlock_t		queue_lock;
+	struct work_struct	work;
+	struct workqueue_struct	*wq;
+	bool			stopping;
 	struct eip93_ring	ring[];
 };
 
@@ -147,5 +158,9 @@ struct eip93_alg_template {
 		struct ahash_alg	ahash;
 	} alg;
 };
+
+int eip93_queue_init(struct eip93_device *eip93);
+void eip93_queue_exit(struct eip93_device *eip93);
+int eip93_enqueue(struct eip93_device *eip93, struct crypto_async_request *async);
 
 #endif /* _EIP93_MAIN_H_ */

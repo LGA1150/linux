@@ -242,8 +242,7 @@ get_more:
 		goto get_more;
 
 	/* Get crypto async ref only for last descriptor */
-	scoped_guard(spinlock_bh, &eip93->ring->idr_lock)
-		async = idr_remove(&eip93->ring->crypto_async_idr, crypto_idr);
+	async = eip93_take_req(eip93, crypto_idr);
 	if (!async) {
 		dev_err_ratelimited(eip93->dev,
 				    "Missing request: id=%#x flags=%#x ctrl=%#x len=%#x\n",
@@ -392,6 +391,9 @@ static int eip93_desc_init(struct eip93_device *eip93)
 
 static void eip93_cleanup(struct eip93_device *eip93)
 {
+	/* Drain submission and hardware while completion interrupts still run. */
+	eip93_queue_exit(eip93);
+	disable_irq(eip93->irq);
 	tasklet_kill(&eip93->ring->done_task);
 
 	/* Clear/ack all interrupts before disable all */
@@ -443,6 +445,15 @@ static int eip93_crypto_probe(struct platform_device *pdev)
 
 	spin_lock_init(&eip93->ring->idr_lock);
 	idr_init(&eip93->ring->crypto_async_idr);
+	sema_init(&eip93->ring->requests, EIP93_RING_NUM - 1);
+	sema_init(&eip93->ring->slots, EIP93_RING_NUM - 1);
+	init_waitqueue_head(&eip93->ring->idle);
+
+	ret = eip93_queue_init(eip93);
+	if (ret) {
+		idr_destroy(&eip93->ring->crypto_async_idr);
+		return ret;
+	}
 
 	algo_flags = readl(eip93->base + EIP93_REG_PE_OPTION_1);
 

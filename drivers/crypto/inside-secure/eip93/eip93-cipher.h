@@ -46,6 +46,8 @@ struct eip93_cipher_reqctx {
 void eip93_unmap_dma(struct eip93_device *eip93, struct eip93_cipher_reqctx *rctx,
 		     struct scatterlist *reqsrc, struct scatterlist *reqdst);
 
+int eip93_skcipher_submit(struct crypto_async_request *async);
+
 void eip93_skcipher_handle_result(struct crypto_async_request *async, int err);
 
 int eip93_send_req(struct crypto_async_request *async,

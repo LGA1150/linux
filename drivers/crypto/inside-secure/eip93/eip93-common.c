@@ -12,7 +12,6 @@
 #include <crypto/sha1.h>
 #include <crypto/sha2.h>
 #include <linux/kernel.h>
-#include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/scatterlist.h>
 
@@ -27,21 +26,40 @@ int eip93_alloc_req_id(struct eip93_device *eip93,
 {
 	int id;
 
+	/* Only the submission worker reserves IDs; completions return credits. */
+	down(&eip93->ring->requests);
+	idr_preload(GFP_KERNEL);
 	scoped_guard(spinlock_bh, &eip93->ring->idr_lock)
 		id = idr_alloc(&eip93->ring->crypto_async_idr, async, 0,
-			       EIP93_RING_NUM - 1, GFP_ATOMIC);
+			       EIP93_RING_NUM - 1, GFP_NOWAIT);
+	idr_preload_end();
 
-	if (id < 0)
+	if (id < 0) {
+		up(&eip93->ring->requests);
 		dev_err_ratelimited(eip93->dev,
 				    "Failed to allocate request ID: %d\n", id);
+	}
 
 	return id;
 }
 
+struct crypto_async_request *eip93_take_req(struct eip93_device *eip93, int id)
+{
+	struct crypto_async_request *async;
+
+	scoped_guard(spinlock_bh, &eip93->ring->idr_lock)
+		async = idr_remove(&eip93->ring->crypto_async_idr, id);
+	if (async) {
+		up(&eip93->ring->requests);
+		wake_up(&eip93->ring->idle);
+	}
+
+	return async;
+}
+
 void eip93_free_req_id(struct eip93_device *eip93, int id)
 {
-	scoped_guard(spinlock_bh, &eip93->ring->idr_lock)
-		idr_remove(&eip93->ring->crypto_async_idr, id);
+	eip93_take_req(eip93, id);
 }
 
 int eip93_parse_ctrl_stat_err(struct eip93_device *eip93, int err)
@@ -95,17 +113,15 @@ static void eip93_ring_advance(struct eip93_desc_ring *ring, void **ptr)
 		*ptr += ring->offset;
 }
 
-int eip93_put_descriptor(struct eip93_device *eip93,
-			 struct eip93_descriptor *desc)
+void eip93_put_descriptor(struct eip93_device *eip93,
+			  struct eip93_descriptor *desc)
 {
 	struct eip93_desc_ring *cdr = &eip93->ring->cdr;
 	struct eip93_desc_ring *rdr = &eip93->ring->rdr;
 
+	/* A request may span more than one ring; wait for each free slot. */
+	down(&eip93->ring->slots);
 	guard(spinlock_irqsave)(&eip93->ring->lock);
-
-	if ((cdr->write == cdr->read - cdr->offset) ||
-	    (cdr->read == cdr->base && cdr->write == cdr->base_end))
-		return -ENOSPC;
 
 	memset(rdr->write, 0, sizeof(struct eip93_descriptor));
 	memcpy(cdr->write, desc, sizeof(struct eip93_descriptor));
@@ -115,8 +131,6 @@ int eip93_put_descriptor(struct eip93_device *eip93,
 	/* Publish the descriptor before ringing the doorbell. */
 	dma_wmb();
 	writel(1, eip93->base + EIP93_REG_PE_CD_COUNT);
-
-	return 0;
 }
 
 int eip93_get_descriptor(struct eip93_device *eip93,
@@ -149,6 +163,7 @@ int eip93_get_descriptor(struct eip93_device *eip93,
 	writel(1, eip93->base + EIP93_REG_PE_RD_COUNT);
 	eip93_ring_advance(cdr, &cdr->read);
 	eip93_ring_advance(rdr, &rdr->read);
+	up(&eip93->ring->slots);
 
 	return 0;
 }
@@ -409,7 +424,6 @@ static int eip93_scatter_combine(struct eip93_device *eip93,
 	bool nextin = false;
 	bool nextout = false;
 	int offsetout = 0;
-	int err;
 
 	if (IS_ECB(rctx->flags))
 		rctx->sa_state_base = 0;
@@ -505,17 +519,7 @@ static int eip93_scatter_combine(struct eip93_device *eip93,
 			cdesc->user_id |= FIELD_PREP(EIP93_PE_USER_ID_DESC_FLAGS,
 						     EIP93_DESC_LAST);
 
-		/*
-		 * Loop - Delay - No need to rollback
-		 * Maybe refine by slowing down at EIP93_RING_BUSY
-		 */
-again:
-		err = eip93_put_descriptor(eip93, cdesc);
-		if (err) {
-			usleep_range(EIP93_RING_BUSY_DELAY,
-				     EIP93_RING_BUSY_DELAY * 2);
-			goto again;
-		}
+		eip93_put_descriptor(eip93, cdesc);
 	} while (n);
 
 	return -EINPROGRESS;

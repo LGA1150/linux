@@ -11,11 +11,13 @@
 
 int eip93_alloc_req_id(struct eip93_device *eip93,
 		       struct crypto_async_request *async);
+struct crypto_async_request *eip93_take_req(struct eip93_device *eip93, int id);
 void eip93_free_req_id(struct eip93_device *eip93, int id);
 
 int eip93_get_descriptor(struct eip93_device *eip93,
 			 struct eip93_descriptor *desc);
-int eip93_put_descriptor(struct eip93_device *eip93, struct eip93_descriptor *desc);
+void eip93_put_descriptor(struct eip93_device *eip93,
+			  struct eip93_descriptor *desc);
 
 void eip93_set_sa_record(struct sa_record *sa_record, const unsigned int keylen,
 			 const u32 flags);

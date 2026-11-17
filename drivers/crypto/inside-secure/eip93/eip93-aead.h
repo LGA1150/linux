@@ -33,6 +33,8 @@ extern struct eip93_alg_template eip93_alg_authenc_hmac_sha1_ecb_null;
 extern struct eip93_alg_template eip93_alg_authenc_hmac_sha224_ecb_null;
 extern struct eip93_alg_template eip93_alg_authenc_hmac_sha256_ecb_null;
 
+int eip93_aead_submit(struct crypto_async_request *async);
+
 void eip93_aead_handle_result(struct crypto_async_request *async, int err);
 
 #endif /* _EIP93_AEAD_H_ */

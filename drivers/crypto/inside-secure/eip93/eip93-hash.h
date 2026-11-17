@@ -21,6 +21,12 @@ struct eip93_hash_ctx {
 	u8			opad[SHA256_DIGEST_SIZE] __aligned(sizeof(u32));
 };
 
+enum eip93_hash_op {
+	EIP93_HASH_UPDATE,
+	EIP93_HASH_FINAL,
+	EIP93_HASH_FINUP,
+};
+
 struct eip93_hash_reqctx {
 	/* Placement is important for DMA align */
 	struct {
@@ -33,6 +39,7 @@ struct eip93_hash_reqctx {
 	dma_addr_t		sa_record_hmac_base;
 	dma_addr_t		sa_state_base;
 	int			request_id;
+	enum eip93_hash_op	op;
 	bool			hmac_mapped;
 	bool			data_mapped;
 	struct eip93_descriptor	desc;
@@ -73,6 +80,8 @@ struct eip93_hash_export_state {
 
 	u8			data[SHA256_BLOCK_SIZE] __aligned(sizeof(u32));
 };
+
+int eip93_hash_submit(struct crypto_async_request *async);
 
 void eip93_hash_handle_result(struct crypto_async_request *async, int err);
 

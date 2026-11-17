@@ -122,7 +122,6 @@ static int eip93_skcipher_crypt(struct skcipher_request *req)
 	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(req->base.tfm);
 	struct eip93_device *eip93 = ctx->eip93;
 	struct crypto_skcipher *skcipher = crypto_skcipher_reqtfm(req);
-	int ret, request_id;
 
 	if (!req->cryptlen)
 		return 0;
@@ -135,6 +134,18 @@ static int eip93_skcipher_crypt(struct skcipher_request *req)
 		if (!IS_ALIGNED(req->cryptlen,
 				crypto_skcipher_blocksize(skcipher)))
 			return -EINVAL;
+
+	return eip93_enqueue(eip93, async);
+}
+
+int eip93_skcipher_submit(struct crypto_async_request *async)
+{
+	struct skcipher_request *req = skcipher_request_cast(async);
+	struct eip93_cipher_reqctx *rctx = skcipher_request_ctx(req);
+	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(async->tfm);
+	struct crypto_skcipher *skcipher = crypto_skcipher_reqtfm(req);
+	struct eip93_device *eip93 = ctx->eip93;
+	int ret, request_id;
 
 	/* Reserve completion tracking before any DMA or bounce preparation. */
 	request_id = eip93_alloc_req_id(eip93, async);

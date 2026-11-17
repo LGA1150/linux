@@ -151,10 +151,10 @@ static int eip93_aead_setauthsize(struct crypto_aead *ctfm,
 	return 0;
 }
 
-static int eip93_aead_crypt(struct aead_request *req)
+int eip93_aead_submit(struct crypto_async_request *async)
 {
+	struct aead_request *req = aead_request_cast(async);
 	struct eip93_cipher_reqctx *rctx = aead_request_ctx(req);
-	struct crypto_async_request *async = &req->base;
 	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(req->base.tfm);
 	struct eip93_device *eip93 = ctx->eip93;
 	struct crypto_aead *aead = crypto_aead_reqtfm(req);
@@ -194,7 +194,7 @@ static int eip93_aead_encrypt(struct aead_request *req)
 	rctx->flags = ctx->flags;
 	rctx->flags |= EIP93_ENCRYPT;
 
-	return eip93_aead_crypt(req);
+	return eip93_enqueue(ctx->eip93, &req->base);
 }
 
 static int eip93_aead_decrypt(struct aead_request *req)
@@ -205,7 +205,7 @@ static int eip93_aead_decrypt(struct aead_request *req)
 	rctx->flags = ctx->flags;
 	rctx->flags |= EIP93_DECRYPT;
 
-	return eip93_aead_crypt(req);
+	return eip93_enqueue(ctx->eip93, &req->base);
 }
 
 /* Available authenc algorithms in this module */
