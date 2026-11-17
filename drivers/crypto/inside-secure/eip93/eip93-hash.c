@@ -27,17 +27,19 @@ static void eip93_hash_free_data_blocks(struct ahash_request *req)
 	struct mkt_hash_block *block, *tmp;
 
 	list_for_each_entry_safe(block, tmp, &rctx->blocks, list) {
-		dma_unmap_single(eip93->dev, block->data_dma,
-				 SHA256_BLOCK_SIZE, DMA_TO_DEVICE);
+		if (block->data_mapped)
+			dma_unmap_single(eip93->dev, block->data_dma,
+					 SHA256_BLOCK_SIZE, DMA_TO_DEVICE);
 		kfree(block);
 	}
 	if (!list_empty(&rctx->blocks))
 		INIT_LIST_HEAD(&rctx->blocks);
 
-	if (rctx->finalize)
+	if (rctx->data_mapped)
 		dma_unmap_single(eip93->dev, rctx->data_dma,
 				 rctx->data_used,
 				 DMA_TO_DEVICE);
+	rctx->data_mapped = false;
 }
 
 static void eip93_hash_free_sa_record(struct ahash_request *req)
@@ -47,9 +49,10 @@ static void eip93_hash_free_sa_record(struct ahash_request *req)
 	struct eip93_hash_ctx *ctx = crypto_ahash_ctx(ahash);
 	struct eip93_device *eip93 = ctx->eip93;
 
-	if (IS_HMAC(ctx->flags))
+	if (rctx->hmac_mapped)
 		dma_unmap_single(eip93->dev, rctx->sa_record_hmac_base,
 				 sizeof(rctx->sa_record_hmac), DMA_TO_DEVICE);
+	rctx->hmac_mapped = false;
 
 	dma_unmap_single(eip93->dev, rctx->sa_record_base,
 			 sizeof(rctx->sa_record), DMA_TO_DEVICE);
@@ -67,7 +70,7 @@ void eip93_hash_handle_result(struct crypto_async_request *async, int err)
 	int i;
 
 	dma_unmap_single(eip93->dev, rctx->sa_state_base,
-			 sizeof(*sa_state), DMA_FROM_DEVICE);
+			 sizeof(*sa_state), DMA_BIDIRECTIONAL);
 
 	/*
 	 * With partial_hash assume SHA256_DIGEST_SIZE buffer is passed.
@@ -202,40 +205,45 @@ static void __eip93_hash_init(struct ahash_request *req)
 	rctx->data_used = 0;
 	rctx->partial_hash = false;
 	rctx->finalize = false;
+	rctx->hmac_mapped = false;
+	rctx->data_mapped = false;
 	INIT_LIST_HEAD(&rctx->blocks);
 }
 
-static int eip93_send_hash_req(struct crypto_async_request *async, u8 *data,
-			       dma_addr_t *data_dma, u32 len, bool last)
+static int eip93_prepare_hash_req(struct crypto_async_request *async, u8 *data,
+				  dma_addr_t *data_dma, bool *data_mapped,
+				  struct eip93_descriptor *cdesc, u32 len,
+				  bool last)
 {
 	struct ahash_request *req = ahash_request_cast(async);
 	struct eip93_hash_reqctx *rctx = ahash_request_ctx_dma(req);
 	struct crypto_ahash *ahash = crypto_ahash_reqtfm(req);
 	struct eip93_hash_ctx *ctx = crypto_ahash_ctx(ahash);
 	struct eip93_device *eip93 = ctx->eip93;
-	struct eip93_descriptor cdesc = { };
 	dma_addr_t src_addr;
-	int ret;
+
+	memset(cdesc, 0, sizeof(*cdesc));
 
 	/* Map block data to DMA */
 	src_addr = dma_map_single(eip93->dev, data, len, DMA_TO_DEVICE);
-	ret = dma_mapping_error(eip93->dev, src_addr);
-	if (ret)
-		return ret;
+	if (dma_mapping_error(eip93->dev, src_addr))
+		return -ENOMEM;
+	*data_dma = src_addr;
+	*data_mapped = true;
 
-	cdesc.pe_ctrl_stat_word = FIELD_PREP(EIP93_PE_CTRL_PE_READY_DES_TRING_OWN,
-					     EIP93_PE_CTRL_HOST_READY);
-	cdesc.sa_addr = rctx->sa_record_base;
-	cdesc.arc4_addr = 0;
+	cdesc->pe_ctrl_stat_word = FIELD_PREP(EIP93_PE_CTRL_PE_READY_DES_TRING_OWN,
+					      EIP93_PE_CTRL_HOST_READY);
+	cdesc->sa_addr = rctx->sa_record_base;
+	cdesc->arc4_addr = 0;
 
-	cdesc.state_addr = rctx->sa_state_base;
-	cdesc.src_addr = src_addr;
-	cdesc.pe_length_word = FIELD_PREP(EIP93_PE_LENGTH_HOST_PE_READY,
-					  EIP93_PE_LENGTH_HOST_READY);
-	cdesc.pe_length_word |= FIELD_PREP(EIP93_PE_LENGTH_LENGTH,
+	cdesc->state_addr = rctx->sa_state_base;
+	cdesc->src_addr = src_addr;
+	cdesc->pe_length_word = FIELD_PREP(EIP93_PE_LENGTH_HOST_PE_READY,
+					   EIP93_PE_LENGTH_HOST_READY);
+	cdesc->pe_length_word |= FIELD_PREP(EIP93_PE_LENGTH_LENGTH,
 					   len);
 
-	cdesc.user_id |= FIELD_PREP(EIP93_PE_USER_ID_DESC_FLAGS, EIP93_DESC_HASH);
+	cdesc->user_id |= FIELD_PREP(EIP93_PE_USER_ID_DESC_FLAGS, EIP93_DESC_HASH);
 
 	if (last) {
 		if (rctx->finalize && !rctx->partial_hash) {
@@ -247,23 +255,31 @@ static int eip93_send_hash_req(struct crypto_async_request *async, u8 *data,
 									   sa_record_hmac,
 									   sizeof(*sa_record_hmac),
 									   DMA_TO_DEVICE);
-				ret = dma_mapping_error(eip93->dev, rctx->sa_record_hmac_base);
-				if (ret)
-					return ret;
+				if (dma_mapping_error(eip93->dev, rctx->sa_record_hmac_base))
+					return -ENOMEM;
+				rctx->hmac_mapped = true;
 
-				cdesc.sa_addr = rctx->sa_record_hmac_base;
+				cdesc->sa_addr = rctx->sa_record_hmac_base;
 			}
 
-			cdesc.pe_ctrl_stat_word |= EIP93_PE_CTRL_PE_HASH_FINAL;
+			cdesc->pe_ctrl_stat_word |= EIP93_PE_CTRL_PE_HASH_FINAL;
 		}
 
-		cdesc.user_id |= FIELD_PREP(EIP93_PE_USER_ID_CRYPTO_IDR, rctx->request_id) |
+		cdesc->user_id |= FIELD_PREP(EIP93_PE_USER_ID_CRYPTO_IDR, rctx->request_id) |
 				 FIELD_PREP(EIP93_PE_USER_ID_DESC_FLAGS, EIP93_DESC_LAST);
 	}
 
+	return 0;
+}
+
+static void eip93_send_hash_req(struct eip93_device *eip93,
+				struct eip93_descriptor *cdesc)
+{
+	int ret;
+
 again:
 	scoped_guard(spinlock_irqsave, &eip93->ring->write_lock)
-		ret = eip93_put_descriptor(eip93, &cdesc);
+		ret = eip93_put_descriptor(eip93, cdesc);
 	if (ret) {
 		usleep_range(EIP93_RING_BUSY_DELAY,
 			     EIP93_RING_BUSY_DELAY * 2);
@@ -272,9 +288,6 @@ again:
 
 	/* Writing new descriptor count starts DMA action */
 	writel(1, eip93->base + EIP93_REG_PE_CD_COUNT);
-
-	*data_dma = src_addr;
-	return 0;
 }
 
 static int eip93_hash_init(struct ahash_request *req)
@@ -302,20 +315,23 @@ static int eip93_hash_init(struct ahash_request *req)
 }
 
 /*
- * With complete_req true, we wait for the engine to consume all the block in list,
- * else we just queue the block to the engine as final() will wait. This is useful
- * for finup().
+ * Prepare all blocks before publishing any descriptor. finup defers
+ * publication until the final block and its HMAC record are prepared too.
  */
 static int __eip93_hash_update(struct ahash_request *req, bool complete_req)
 {
 	struct eip93_hash_reqctx *rctx = ahash_request_ctx_dma(req);
 	struct crypto_async_request *async = &req->base;
+	struct eip93_hash_ctx *ctx = crypto_ahash_ctx(crypto_ahash_reqtfm(req));
 	unsigned int read, to_consume = req->nbytes;
 	unsigned int max_read, consumed = 0;
 	struct mkt_hash_block *block;
 	bool wait_req = false;
 	int offset;
 	int ret;
+
+	if (sg_nents_for_len(req->src, req->nbytes) < 0)
+		return -EINVAL;
 
 	/* Get the offset and available space to fill req data */
 	offset = rctx->data_used;
@@ -365,14 +381,25 @@ static int __eip93_hash_update(struct ahash_request *req, bool complete_req)
 		wait_req = complete_req &&
 			    list_is_first(&block->list, &rctx->blocks);
 
-		ret = eip93_send_hash_req(async, block->data,
-					  &block->data_dma,
-					  SHA256_BLOCK_SIZE, wait_req);
+		ret = eip93_prepare_hash_req(async, block->data,
+					     &block->data_dma, &block->data_mapped,
+					     &block->desc, SHA256_BLOCK_SIZE,
+					     wait_req);
 		if (ret)
 			goto free_blocks;
 	}
 
-	return wait_req ? -EINPROGRESS : 0;
+	if (complete_req) {
+		list_for_each_entry_reverse(block, &rctx->blocks, list) {
+			wait_req = list_is_first(&block->list, &rctx->blocks);
+			eip93_send_hash_req(ctx->eip93, &block->desc);
+			/* Completion may free the list immediately after submission. */
+			if (wait_req)
+				return -EINPROGRESS;
+		}
+	}
+
+	return 0;
 
 free_blocks:
 	eip93_hash_free_data_blocks(req);
@@ -400,32 +427,30 @@ static int eip93_hash_update(struct ahash_request *req)
 
 	rctx->sa_state_base = dma_map_single(eip93->dev, sa_state,
 					     sizeof(*sa_state),
-					     DMA_TO_DEVICE);
-	ret = dma_mapping_error(eip93->dev, rctx->sa_state_base);
-	if (ret)
+					     DMA_BIDIRECTIONAL);
+	if (dma_mapping_error(eip93->dev, rctx->sa_state_base)) {
+		ret = -ENOMEM;
 		goto free_request_id;
+	}
 
 	rctx->sa_record_base = dma_map_single(eip93->dev, sa_record,
 					      sizeof(*sa_record),
 					      DMA_TO_DEVICE);
-	ret = dma_mapping_error(eip93->dev, rctx->sa_record_base);
-	if (ret)
+	if (dma_mapping_error(eip93->dev, rctx->sa_record_base)) {
+		ret = -ENOMEM;
 		goto free_sa_state;
+	}
 
 	ret = __eip93_hash_update(req, true);
-	if (ret && ret != -EINPROGRESS)
-		goto free_sa_record;
 	if (ret == -EINPROGRESS)
 		return ret;
-	goto free_request_id;
 
-free_sa_record:
 	dma_unmap_single(eip93->dev, rctx->sa_record_base,
 			 sizeof(*sa_record), DMA_TO_DEVICE);
 
 free_sa_state:
 	dma_unmap_single(eip93->dev, rctx->sa_state_base,
-			 sizeof(*sa_state), DMA_TO_DEVICE);
+			 sizeof(*sa_state), DMA_BIDIRECTIONAL);
 
 free_request_id:
 	eip93_free_req_id(eip93, request_id);
@@ -446,6 +471,7 @@ static int __eip93_hash_final(struct ahash_request *req, bool map_dma)
 	struct sa_record *sa_record = &rctx->sa_record;
 	struct sa_state *sa_state = &rctx->sa_state;
 	struct eip93_device *eip93 = ctx->eip93;
+	struct mkt_hash_block *block;
 	int ret;
 
 	/* EIP93 can't handle zero bytes hash */
@@ -480,24 +506,31 @@ static int __eip93_hash_final(struct ahash_request *req, bool map_dma)
 	if (map_dma) {
 		rctx->sa_state_base = dma_map_single(eip93->dev, sa_state,
 						     sizeof(*sa_state),
-						     DMA_TO_DEVICE);
-		ret = dma_mapping_error(eip93->dev, rctx->sa_state_base);
-		if (ret)
+						     DMA_BIDIRECTIONAL);
+		if (dma_mapping_error(eip93->dev, rctx->sa_state_base)) {
+			ret = -ENOMEM;
 			return ret;
+		}
 
 		rctx->sa_record_base = dma_map_single(eip93->dev, sa_record,
 						      sizeof(*sa_record),
 						      DMA_TO_DEVICE);
-		ret = dma_mapping_error(eip93->dev, rctx->sa_record_base);
-		if (ret)
+		if (dma_mapping_error(eip93->dev, rctx->sa_record_base)) {
+			ret = -ENOMEM;
 			goto free_sa_state;
+		}
 	}
 
 	/* Send last block */
-	ret = eip93_send_hash_req(async, rctx->data, &rctx->data_dma,
-				  rctx->data_used, true);
+	ret = eip93_prepare_hash_req(async, rctx->data, &rctx->data_dma,
+				     &rctx->data_mapped, &rctx->desc,
+				     rctx->data_used, true);
 	if (ret)
 		goto free_blocks;
+
+	list_for_each_entry_reverse(block, &rctx->blocks, list)
+		eip93_send_hash_req(eip93, &block->desc);
+	eip93_send_hash_req(eip93, &rctx->desc);
 
 	return -EINPROGRESS;
 
@@ -509,7 +542,7 @@ free_blocks:
 
 free_sa_state:
 	dma_unmap_single(eip93->dev, rctx->sa_state_base,
-			 sizeof(*sa_state), DMA_TO_DEVICE);
+			 sizeof(*sa_state), DMA_BIDIRECTIONAL);
 
 	return ret;
 }
@@ -558,17 +591,19 @@ static int eip93_hash_finup(struct ahash_request *req)
 	if (rctx->len + req->nbytes || IS_HMAC(ctx->flags)) {
 		rctx->sa_state_base = dma_map_single(eip93->dev, sa_state,
 						     sizeof(*sa_state),
-						     DMA_TO_DEVICE);
-		ret = dma_mapping_error(eip93->dev, rctx->sa_state_base);
-		if (ret)
+						     DMA_BIDIRECTIONAL);
+		if (dma_mapping_error(eip93->dev, rctx->sa_state_base)) {
+			ret = -ENOMEM;
 			goto free_request_id;
+		}
 
 		rctx->sa_record_base = dma_map_single(eip93->dev, sa_record,
 						      sizeof(*sa_record),
 						      DMA_TO_DEVICE);
-		ret = dma_mapping_error(eip93->dev, rctx->sa_record_base);
-		if (ret)
+		if (dma_mapping_error(eip93->dev, rctx->sa_record_base)) {
+			ret = -ENOMEM;
 			goto free_sa_state;
+		}
 
 		ret = __eip93_hash_update(req, false);
 		if (ret)
@@ -585,7 +620,7 @@ free_sa_record:
 			 sizeof(*sa_record), DMA_TO_DEVICE);
 free_sa_state:
 	dma_unmap_single(eip93->dev, rctx->sa_state_base,
-			 sizeof(*sa_state), DMA_TO_DEVICE);
+			 sizeof(*sa_state), DMA_BIDIRECTIONAL);
 
 free_request_id:
 	eip93_free_req_id(eip93, request_id);
