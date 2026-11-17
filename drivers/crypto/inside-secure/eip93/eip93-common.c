@@ -556,11 +556,29 @@ int eip93_send_req(struct crypto_async_request *async,
 	src = rctx->sg_src;
 	dst = rctx->sg_dst;
 
-	rctx->sa_record_base = dma_map_single(eip93->dev, ctx->sa_record,
-					      sizeof(*ctx->sa_record), DMA_TO_DEVICE);
-	if (dma_mapping_error(eip93->dev, rctx->sa_record_base)) {
+	rctx->sa_record = kmemdup(ctx->sa_record, sizeof(*ctx->sa_record),
+				  GFP_KERNEL);
+	if (!rctx->sa_record) {
 		err = -ENOMEM;
 		goto free_sg_copy;
+	}
+	if (IS_DECRYPT(flags))
+		rctx->sa_record->sa_cmd0_word |= EIP93_SA_CMD_DIRECTION_IN;
+	if (IS_HMAC(flags)) {
+		rctx->sa_record->sa_cmd1_word &= ~EIP93_SA_CMD_HASH_CRYPT_OFFSET;
+		rctx->sa_record->sa_cmd1_word |=
+			FIELD_PREP(EIP93_SA_CMD_HASH_CRYPT_OFFSET,
+				   rctx->assoclen / sizeof(u32));
+		if (IS_DECRYPT(flags))
+			rctx->sa_record->sa_cmd1_word &= ~(EIP93_SA_CMD_COPY_PAD |
+							 EIP93_SA_CMD_COPY_DIGEST);
+	}
+
+	rctx->sa_record_base = dma_map_single(eip93->dev, rctx->sa_record,
+					      sizeof(*rctx->sa_record), DMA_TO_DEVICE);
+	if (dma_mapping_error(eip93->dev, rctx->sa_record_base)) {
+		err = -ENOMEM;
+		goto free_sa_record;
 	}
 
 	if (IS_ECB(flags))
@@ -669,6 +687,8 @@ free_sa_state:
 unmap_sa_record:
 	dma_unmap_single(eip93->dev, rctx->sa_record_base,
 			 sizeof(*ctx->sa_record), DMA_TO_DEVICE);
+free_sa_record:
+	kfree(rctx->sa_record);
 free_sg_copy:
 	/* No descriptor was submitted: discard bounce buffers without copyback. */
 	if (rctx->sg_src != reqsrc)
@@ -728,6 +748,7 @@ void eip93_handle_result(struct eip93_device *eip93, struct eip93_cipher_reqctx 
 {
 	dma_unmap_single(eip93->dev, rctx->sa_record_base,
 			 sizeof(struct sa_record), DMA_TO_DEVICE);
+	kfree(rctx->sa_record);
 
 	if (rctx->sa_state_ctr)
 		dma_unmap_single(eip93->dev, rctx->sa_state_ctr_base,

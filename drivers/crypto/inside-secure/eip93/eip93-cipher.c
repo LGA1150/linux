@@ -173,12 +173,9 @@ static int eip93_skcipher_encrypt(struct skcipher_request *req)
 
 static int eip93_skcipher_decrypt(struct skcipher_request *req)
 {
-	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(req->base.tfm);
 	struct eip93_cipher_reqctx *rctx = skcipher_request_ctx(req);
 	struct eip93_alg_template *tmpl = container_of(req->base.tfm->__crt_alg,
 				struct eip93_alg_template, alg.skcipher.base);
-
-	ctx->sa_record->sa_cmd0_word |= EIP93_SA_CMD_DIRECTION_IN;
 
 	rctx->flags = tmpl->flags;
 	rctx->flags |= EIP93_DECRYPT;

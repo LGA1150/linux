@@ -53,7 +53,6 @@ static int eip93_aead_cra_init(struct crypto_tfm *tfm)
 	ctx->eip93 = tmpl->eip93;
 	ctx->flags = tmpl->flags;
 	ctx->type = tmpl->type;
-	ctx->set_assoc = true;
 
 	ctx->sa_record = kzalloc_obj(*ctx->sa_record);
 	if (!ctx->sa_record)
@@ -134,7 +133,6 @@ static int eip93_aead_setkey(struct crypto_aead *ctfm, const u8 *key,
 				ctx->authsize, sa_record->sa_i_digest,
 				sa_record->sa_o_digest, false);
 
-	ctx->set_assoc = true;
 
 	return ret;
 }
@@ -151,18 +149,6 @@ static int eip93_aead_setauthsize(struct crypto_aead *ctfm,
 						   ctx->authsize / sizeof(u32));
 
 	return 0;
-}
-
-static void eip93_aead_setassoc(struct eip93_crypto_ctx *ctx,
-				struct aead_request *req)
-{
-	struct sa_record *sa_record = ctx->sa_record;
-
-	sa_record->sa_cmd1_word &= ~EIP93_SA_CMD_HASH_CRYPT_OFFSET;
-	sa_record->sa_cmd1_word |= FIELD_PREP(EIP93_SA_CMD_HASH_CRYPT_OFFSET,
-					      req->assoclen / sizeof(u32));
-
-	ctx->assoclen = req->assoclen;
 }
 
 static int eip93_aead_crypt(struct aead_request *req)
@@ -207,15 +193,6 @@ static int eip93_aead_encrypt(struct aead_request *req)
 
 	rctx->flags = ctx->flags;
 	rctx->flags |= EIP93_ENCRYPT;
-	if (ctx->set_assoc) {
-		eip93_aead_setassoc(ctx, req);
-		ctx->set_assoc = false;
-	}
-
-	if (req->assoclen != ctx->assoclen) {
-		dev_err(ctx->eip93->dev, "Request AAD length error\n");
-		return -EINVAL;
-	}
 
 	return eip93_aead_crypt(req);
 }
@@ -225,21 +202,8 @@ static int eip93_aead_decrypt(struct aead_request *req)
 	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(req->base.tfm);
 	struct eip93_cipher_reqctx *rctx = aead_request_ctx(req);
 
-	ctx->sa_record->sa_cmd0_word |= EIP93_SA_CMD_DIRECTION_IN;
-	ctx->sa_record->sa_cmd1_word &= ~(EIP93_SA_CMD_COPY_PAD |
-					  EIP93_SA_CMD_COPY_DIGEST);
-
 	rctx->flags = ctx->flags;
 	rctx->flags |= EIP93_DECRYPT;
-	if (ctx->set_assoc) {
-		eip93_aead_setassoc(ctx, req);
-		ctx->set_assoc = false;
-	}
-
-	if (req->assoclen != ctx->assoclen) {
-		dev_err(ctx->eip93->dev, "Request AAD length error\n");
-		return -EINVAL;
-	}
 
 	return eip93_aead_crypt(req);
 }

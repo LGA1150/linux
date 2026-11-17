@@ -18,8 +18,6 @@ struct eip93_crypto_ctx {
 	int				blksize;
 	/* AEAD specific */
 	unsigned int			authsize;
-	unsigned int			assoclen;
-	bool				set_assoc;
 	enum eip93_alg_type		type;
 };
 
@@ -32,6 +30,7 @@ struct eip93_cipher_reqctx {
 	unsigned int			textsize;
 	unsigned int			assoclen;
 	unsigned int			authsize;
+	struct sa_record		*sa_record;
 	dma_addr_t			sa_record_base;
 	struct sa_state			*sa_state;
 	dma_addr_t			sa_state_base;
