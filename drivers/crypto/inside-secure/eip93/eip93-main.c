@@ -249,9 +249,13 @@ get_more:
 		goto get_more;
 
 	/* Get crypto async ref only for last descriptor */
-	scoped_guard(spinlock_bh, &eip93->ring->idr_lock) {
-		async = idr_find(&eip93->ring->crypto_async_idr, crypto_idr);
-		idr_remove(&eip93->ring->crypto_async_idr, crypto_idr);
+	scoped_guard(spinlock_bh, &eip93->ring->idr_lock)
+		async = idr_remove(&eip93->ring->crypto_async_idr, crypto_idr);
+	if (!async) {
+		dev_err_ratelimited(eip93->dev,
+				    "Missing request: id=%#x flags=%#x ctrl=%#x len=%#x\n",
+				    crypto_idr, desc_flags, pe_ctrl_stat, pe_length);
+		goto get_more;
 	}
 
 	/* Parse error in ctrl stat word */
