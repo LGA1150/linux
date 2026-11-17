@@ -22,6 +22,28 @@
 #include "eip93-main.h"
 #include "eip93-regs.h"
 
+int eip93_alloc_req_id(struct eip93_device *eip93,
+		       struct crypto_async_request *async)
+{
+	int id;
+
+	scoped_guard(spinlock_bh, &eip93->ring->idr_lock)
+		id = idr_alloc(&eip93->ring->crypto_async_idr, async, 0,
+			       EIP93_RING_NUM - 1, GFP_ATOMIC);
+
+	if (id < 0)
+		dev_err_ratelimited(eip93->dev,
+				    "Failed to allocate request ID: %d\n", id);
+
+	return id;
+}
+
+void eip93_free_req_id(struct eip93_device *eip93, int id)
+{
+	scoped_guard(spinlock_bh, &eip93->ring->idr_lock)
+		idr_remove(&eip93->ring->crypto_async_idr, id);
+}
+
 int eip93_parse_ctrl_stat_err(struct eip93_device *eip93, int err)
 {
 	u32 ext_err;
@@ -523,7 +545,6 @@ int eip93_send_req(struct crypto_async_request *async,
 	u32 split = datalen;
 	u32 start, end, ctr, blocks;
 	u32 iv[AES_BLOCK_SIZE / sizeof(u32)];
-	int crypto_async_idr;
 
 	rctx->sa_state_ctr = NULL;
 	rctx->sa_state = NULL;
@@ -592,11 +613,7 @@ skip_iv:
 	cdesc.sa_addr = rctx->sa_record_base;
 	cdesc.arc4_addr = 0;
 
-	scoped_guard(spinlock_bh, &eip93->ring->idr_lock)
-		crypto_async_idr = idr_alloc(&eip93->ring->crypto_async_idr, async, 0,
-					     EIP93_RING_NUM - 1, GFP_ATOMIC);
-
-	cdesc.user_id = FIELD_PREP(EIP93_PE_USER_ID_CRYPTO_IDR, (u16)crypto_async_idr) |
+	cdesc.user_id = FIELD_PREP(EIP93_PE_USER_ID_CRYPTO_IDR, rctx->request_id) |
 			FIELD_PREP(EIP93_PE_USER_ID_DESC_FLAGS, rctx->desc_flags);
 
 	rctx->cdesc = &cdesc;

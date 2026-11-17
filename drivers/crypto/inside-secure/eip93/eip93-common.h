@@ -9,6 +9,10 @@
 #ifndef _EIP93_COMMON_H_
 #define _EIP93_COMMON_H_
 
+int eip93_alloc_req_id(struct eip93_device *eip93,
+		       struct crypto_async_request *async);
+void eip93_free_req_id(struct eip93_device *eip93, int id);
+
 void *eip93_get_descriptor(struct eip93_device *eip93);
 int eip93_put_descriptor(struct eip93_device *eip93, struct eip93_descriptor *desc);
 

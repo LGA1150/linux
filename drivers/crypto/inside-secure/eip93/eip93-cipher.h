@@ -25,6 +25,7 @@ struct eip93_crypto_ctx {
 };
 
 struct eip93_cipher_reqctx {
+	int				request_id;
 	u16				desc_flags;
 	u16				flags;
 	unsigned int			blksize;

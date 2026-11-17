@@ -138,8 +138,9 @@ static int eip93_skcipher_crypt(struct skcipher_request *req)
 	struct eip93_cipher_reqctx *rctx = skcipher_request_ctx(req);
 	struct crypto_async_request *async = &req->base;
 	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(req->base.tfm);
+	struct eip93_device *eip93 = ctx->eip93;
 	struct crypto_skcipher *skcipher = crypto_skcipher_reqtfm(req);
-	int ret;
+	int ret, request_id;
 
 	if (!req->cryptlen)
 		return 0;
@@ -153,11 +154,17 @@ static int eip93_skcipher_crypt(struct skcipher_request *req)
 				crypto_skcipher_blocksize(skcipher)))
 			return -EINVAL;
 
+	/* Reserve completion tracking before any DMA or bounce preparation. */
+	request_id = eip93_alloc_req_id(eip93, async);
+	if (request_id < 0)
+		return request_id;
+	rctx->request_id = request_id;
+
 	ctx->sa_record_base = dma_map_single(ctx->eip93->dev, ctx->sa_record,
 					     sizeof(*ctx->sa_record), DMA_TO_DEVICE);
 	ret = dma_mapping_error(ctx->eip93->dev, ctx->sa_record_base);
 	if (ret)
-		return ret;
+		goto free_request_id;
 
 	rctx->assoclen = 0;
 	rctx->textsize = req->cryptlen;
@@ -169,7 +176,13 @@ static int eip93_skcipher_crypt(struct skcipher_request *req)
 	rctx->desc_flags = EIP93_DESC_SKCIPHER;
 	rctx->sa_record_base = ctx->sa_record_base;
 
-	return eip93_skcipher_send_req(async);
+	ret = eip93_skcipher_send_req(async);
+	if (ret == -EINPROGRESS)
+		return ret;
+
+free_request_id:
+	eip93_free_req_id(eip93, request_id);
+	return ret;
 }
 
 static int eip93_skcipher_encrypt(struct skcipher_request *req)
