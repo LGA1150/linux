@@ -87,76 +87,70 @@ int eip93_parse_ctrl_stat_err(struct eip93_device *eip93, int err)
 	}
 }
 
-static void *eip93_ring_next_wptr(struct eip93_device *eip93,
-				  struct eip93_desc_ring *ring)
+static void eip93_ring_advance(struct eip93_desc_ring *ring, void **ptr)
 {
-	void *ptr = ring->write;
-
-	if ((ring->write == ring->read - ring->offset) ||
-	    (ring->read == ring->base && ring->write == ring->base_end))
-		return ERR_PTR(-ENOMEM);
-
-	if (ring->write == ring->base_end)
-		ring->write = ring->base;
+	if (*ptr == ring->base_end)
+		*ptr = ring->base;
 	else
-		ring->write += ring->offset;
-
-	return ptr;
-}
-
-static void *eip93_ring_next_rptr(struct eip93_device *eip93,
-				  struct eip93_desc_ring *ring)
-{
-	void *ptr = ring->read;
-
-	if (ring->write == ring->read)
-		return ERR_PTR(-ENOENT);
-
-	if (ring->read == ring->base_end)
-		ring->read = ring->base;
-	else
-		ring->read += ring->offset;
-
-	return ptr;
+		*ptr += ring->offset;
 }
 
 int eip93_put_descriptor(struct eip93_device *eip93,
 			 struct eip93_descriptor *desc)
 {
-	struct eip93_descriptor *cdesc;
-	struct eip93_descriptor *rdesc;
+	struct eip93_desc_ring *cdr = &eip93->ring->cdr;
+	struct eip93_desc_ring *rdr = &eip93->ring->rdr;
 
-	rdesc = eip93_ring_next_wptr(eip93, &eip93->ring->rdr);
-	if (IS_ERR(rdesc))
-		return -ENOENT;
+	guard(spinlock_irqsave)(&eip93->ring->lock);
 
-	cdesc = eip93_ring_next_wptr(eip93, &eip93->ring->cdr);
-	if (IS_ERR(cdesc))
-		return -ENOENT;
+	if ((cdr->write == cdr->read - cdr->offset) ||
+	    (cdr->read == cdr->base && cdr->write == cdr->base_end))
+		return -ENOSPC;
 
-	memset(rdesc, 0, sizeof(struct eip93_descriptor));
+	memset(rdr->write, 0, sizeof(struct eip93_descriptor));
+	memcpy(cdr->write, desc, sizeof(struct eip93_descriptor));
+	eip93_ring_advance(cdr, &cdr->write);
+	eip93_ring_advance(rdr, &rdr->write);
 
-	memcpy(cdesc, desc, sizeof(struct eip93_descriptor));
+	/* Publish the descriptor before ringing the doorbell. */
+	dma_wmb();
+	writel(1, eip93->base + EIP93_REG_PE_CD_COUNT);
 
 	return 0;
 }
 
-void *eip93_get_descriptor(struct eip93_device *eip93)
+int eip93_get_descriptor(struct eip93_device *eip93,
+			 struct eip93_descriptor *desc)
 {
-	struct eip93_descriptor *cdesc;
-	void *ptr;
+	struct eip93_desc_ring *cdr = &eip93->ring->cdr;
+	struct eip93_desc_ring *rdr = &eip93->ring->rdr;
+	struct eip93_descriptor *rdesc;
+	u32 ctrl, len;
 
-	cdesc = eip93_ring_next_rptr(eip93, &eip93->ring->cdr);
-	if (IS_ERR(cdesc))
-		return ERR_PTR(-ENOENT);
+	guard(spinlock_irqsave)(&eip93->ring->lock);
 
-	memset(cdesc, 0, sizeof(struct eip93_descriptor));
+	if (cdr->read == cdr->write)
+		return -ENOENT;
 
-	ptr = eip93_ring_next_rptr(eip93, &eip93->ring->rdr);
-	if (IS_ERR(ptr))
-		return ERR_PTR(-ENOENT);
+	rdesc = rdr->read;
+	ctrl = READ_ONCE(rdesc->pe_ctrl_stat_word);
+	len = READ_ONCE(rdesc->pe_length_word);
+	if (FIELD_GET(EIP93_PE_CTRL_PE_READY_DES_TRING_OWN, ctrl) !=
+	    EIP93_PE_CTRL_PE_READY ||
+	    FIELD_GET(EIP93_PE_LENGTH_HOST_PE_READY, len) !=
+	    EIP93_PE_LENGTH_PE_READY)
+		return -EAGAIN;
 
-	return ptr;
+	dma_rmb();
+	*desc = *rdesc;
+	memset(cdr->read, 0, sizeof(struct eip93_descriptor));
+
+	/* Copy and acknowledge the result before allowing slot reuse. */
+	writel(1, eip93->base + EIP93_REG_PE_RD_COUNT);
+	eip93_ring_advance(cdr, &cdr->read);
+	eip93_ring_advance(rdr, &rdr->read);
+
+	return 0;
 }
 
 static void eip93_free_sg_copy(const int len, struct scatterlist **sg)
@@ -516,15 +510,12 @@ static int eip93_scatter_combine(struct eip93_device *eip93,
 		 * Maybe refine by slowing down at EIP93_RING_BUSY
 		 */
 again:
-		scoped_guard(spinlock_irqsave, &eip93->ring->write_lock)
-			err = eip93_put_descriptor(eip93, cdesc);
+		err = eip93_put_descriptor(eip93, cdesc);
 		if (err) {
 			usleep_range(EIP93_RING_BUSY_DELAY,
 				     EIP93_RING_BUSY_DELAY * 2);
 			goto again;
 		}
-		/* Writing new descriptor count starts DMA action */
-		writel(1, eip93->base + EIP93_REG_PE_CD_COUNT);
 	} while (n);
 
 	return -EINPROGRESS;

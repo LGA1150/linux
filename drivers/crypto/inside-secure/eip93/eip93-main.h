@@ -113,8 +113,8 @@ struct eip93_ring {
 	/* command/result rings */
 	struct eip93_desc_ring		cdr;
 	struct eip93_desc_ring		rdr;
-	spinlock_t			write_lock;
-	spinlock_t			read_lock;
+	/* Protect both ring pointers, descriptor copies and doorbells. */
+	spinlock_t			lock;
 	/* aync idr */
 	spinlock_t			idr_lock;
 	struct idr			crypto_async_idr;

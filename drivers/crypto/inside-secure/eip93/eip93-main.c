@@ -186,7 +186,7 @@ fail:
 static void eip93_handle_result_descriptor(struct eip93_device *eip93)
 {
 	struct crypto_async_request *async;
-	struct eip93_descriptor *rdesc;
+	struct eip93_descriptor rdesc;
 	u16 desc_flags, crypto_idr;
 	bool last_entry;
 	int handled, left, err;
@@ -207,33 +207,26 @@ get_more:
 	last_entry = false;
 
 	while (left) {
-		scoped_guard(spinlock_irqsave, &eip93->ring->read_lock)
-			rdesc = eip93_get_descriptor(eip93);
-		if (IS_ERR(rdesc)) {
-			dev_err(eip93->dev, "Ndesc: %d nreq: %d\n",
-				handled, left);
-			err = -EIO;
-			break;
+		err = eip93_get_descriptor(eip93, &rdesc);
+		if (err) {
+			if (err != -EAGAIN)
+				dev_err_ratelimited(eip93->dev, "Ndesc: %d nreq: %d\n",
+						    handled, left);
+			eip93_irq_enable(eip93, EIP93_INT_RDR_THRESH);
+			return;
 		}
-		/* make sure DMA is finished writing */
-		do {
-			pe_ctrl_stat = READ_ONCE(rdesc->pe_ctrl_stat_word);
-			pe_length = READ_ONCE(rdesc->pe_length_word);
-		} while (FIELD_GET(EIP93_PE_CTRL_PE_READY_DES_TRING_OWN, pe_ctrl_stat) !=
-			 EIP93_PE_CTRL_PE_READY ||
-			 FIELD_GET(EIP93_PE_LENGTH_HOST_PE_READY, pe_length) !=
-			 EIP93_PE_LENGTH_PE_READY);
+		pe_ctrl_stat = rdesc.pe_ctrl_stat_word;
+		pe_length = rdesc.pe_length_word;
 
-		err = rdesc->pe_ctrl_stat_word & (EIP93_PE_CTRL_PE_EXT_ERR_CODE |
+		err = rdesc.pe_ctrl_stat_word & (EIP93_PE_CTRL_PE_EXT_ERR_CODE |
 						  EIP93_PE_CTRL_PE_EXT_ERR |
 						  EIP93_PE_CTRL_PE_SEQNUM_ERR |
 						  EIP93_PE_CTRL_PE_PAD_ERR |
 						  EIP93_PE_CTRL_PE_AUTH_ERR);
 
-		desc_flags = FIELD_GET(EIP93_PE_USER_ID_DESC_FLAGS, rdesc->user_id);
-		crypto_idr = FIELD_GET(EIP93_PE_USER_ID_CRYPTO_IDR, rdesc->user_id);
+		desc_flags = FIELD_GET(EIP93_PE_USER_ID_DESC_FLAGS, rdesc.user_id);
+		crypto_idr = FIELD_GET(EIP93_PE_USER_ID_CRYPTO_IDR, rdesc.user_id);
 
-		writel(1, eip93->base + EIP93_REG_PE_RD_COUNT);
 		eip93_irq_clear(eip93, EIP93_INT_RDR_THRESH);
 
 		handled++;
@@ -446,8 +439,7 @@ static int eip93_crypto_probe(struct platform_device *pdev)
 
 	tasklet_init(&eip93->ring->done_task, eip93_done_task, (unsigned long)eip93);
 
-	spin_lock_init(&eip93->ring->read_lock);
-	spin_lock_init(&eip93->ring->write_lock);
+	spin_lock_init(&eip93->ring->lock);
 
 	spin_lock_init(&eip93->ring->idr_lock);
 	idr_init(&eip93->ring->crypto_async_idr);
