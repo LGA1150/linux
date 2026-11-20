@@ -15,11 +15,51 @@ static __ro_after_init DEFINE_STATIC_KEY_FALSE(have_pmull);
 asmlinkage void pmull_ghash_update_p8(size_t blocks, struct polyval_elem *dg,
 				      const u8 *src,
 				      const struct polyval_elem *h);
+asmlinkage void pmull_ghash_update_p8_4x(size_t blocks, struct polyval_elem *dg,
+					 const u8 *src,
+					 const struct ghash_key *key);
 asmlinkage void polyval_mul_pmull(struct polyval_elem *a,
 				  const struct polyval_elem *b);
 asmlinkage void polyval_blocks_pmull(struct polyval_elem *acc,
 				     const struct polyval_key *key,
 				     const u8 *data, size_t nblocks);
+
+#define ghash_preparekey_arch ghash_preparekey_arch
+static void ghash_preparekey_arch(struct ghash_key *key,
+				  const u8 raw_key[GHASH_BLOCK_SIZE])
+{
+	struct polyval_elem power;
+	u64 parts[3][4];
+
+	static_assert(offsetof(struct ghash_key, h) == 0);
+	static_assert(offsetof(struct ghash_key, h_powers_2x) == 16);
+	static_assert(offsetof(struct ghash_key, h_powers_4x) == 256);
+
+	ghash_key_to_polyval(raw_key, &key->h);
+	power = key->h;
+	/* Key preparation is also permitted when SIMD is unavailable. */
+	for (int i = 0; i < 4; i++) {
+		if (i)
+			polyval_mul_generic(&power, &key->h);
+		parts[0][i] = le64_to_cpu(power.lo);
+		parts[1][i] = le64_to_cpu(power.hi);
+		parts[2][i] = parts[0][i] ^ parts[1][i];
+	}
+
+	/* Each 80-byte table supplies both lanes and their byte rotations. */
+	for (int part = 0; part < 3; part++) {
+		for (int rot = 0; rot < 5; rot++) {
+			for (int lane = 0; lane < 2; lane++) {
+				key->h_powers_2x[part][rot][lane] =
+					ror64(parts[part][1 - lane], rot * 8);
+				for (int pair = 0; pair < 2; pair++)
+					key->h_powers_4x[part][pair][rot][lane] =
+						ror64(parts[part][3 - 2 * pair - lane],
+						      rot * 8);
+			}
+		}
+	}
+}
 
 #define polyval_preparekey_arch polyval_preparekey_arch
 static void polyval_preparekey_arch(struct polyval_key *key,
@@ -90,7 +130,7 @@ static void ghash_blocks_arch(struct polyval_elem *acc,
 {
 	if (static_branch_likely(&have_asimd) && may_use_simd()) {
 		scoped_ksimd()
-			pmull_ghash_update_p8(nblocks, acc, data, &key->h);
+			pmull_ghash_update_p8_4x(nblocks, acc, data, key);
 	} else {
 		ghash_blocks_generic(acc, &key->h, data, nblocks);
 	}

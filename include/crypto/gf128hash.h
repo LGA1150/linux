@@ -50,6 +50,19 @@ struct ghash_key {
 #endif
 	/** @h: The hash key H, in POLYVAL format */
 	struct polyval_elem h;
+#if defined(CONFIG_CRYPTO_LIB_GF128HASH_ARCH) && defined(CONFIG_ARM64)
+	/**
+	 * @h_powers_2x: Native-endian low/high/cross parts of H^2 and H,
+	 * with five byte rotations per part, for the ASIMD two-block tail.
+	 */
+	u64 h_powers_2x[3][5][2];
+	/**
+	 * @h_powers_4x: Native-endian low/high/cross parts of H^4, H^3,
+	 * H^2 and H, grouped into two pairs with five byte rotations each.
+	 * Powers use the POLYVAL dot operation on the converted key.
+	 */
+	u64 h_powers_4x[3][2][5][2];
+#endif
 };
 
 /**
