@@ -41,6 +41,8 @@
 	ss2		.req	v25
 	ss3		.req	v26
 	ss4		.req	v27
+	REDUCE_CONST	.req	v28
+	REDUCE_LAST	.req	v29
 
 	.text
 
@@ -154,27 +156,23 @@
 	.endm
 
 	.macro		__pmull_reduce_p8
-	eor		XM.16b, XM.16b, T1.16b
-
-	mov		XL.d[1], XM.d[0]
-	mov		XH.d[0], XM.d[1]
-
-	shl		T1.2d, XL.2d, #57
-	shl		T2.2d, XL.2d, #62
-	eor		T2.16b, T2.16b, T1.16b
-	shl		T1.2d, XL.2d, #63
-	eor		T2.16b, T2.16b, T1.16b
+	eor		T2.16b, XL.16b, XH.16b
 	ext		T1.16b, XL.16b, XH.16b, #8
-	eor		T2.16b, T2.16b, T1.16b
+	eor		XM.16b, XM.16b, T2.16b
+	eor		XM.16b, XM.16b, T1.16b
+	zip1		XL.2d, XL.2d, XM.2d
+	zip2		XH.2d, XM.2d, XH.2d
 
-	mov		XL.d[1], T2.d[0]
-	mov		XH.d[0], T2.d[1]
-
-	ushr		T2.2d, XL.2d, #1
+	pmull		t3.8h, XL.8b, REDUCE_CONST.8b
+	pmull2		t4.8h, XL.16b, REDUCE_CONST.16b
 	eor		XH.16b, XH.16b, XL.16b
-	eor		XL.16b, XL.16b, T2.16b
-	ushr		T2.2d, T2.2d, #6
-	ushr		XL.2d, XL.2d, #1
+	uzp1		t5.16b, t3.16b, t4.16b
+	uzp2		t6.16b, t3.16b, t4.16b
+	ext		t5.16b, t5.16b, t5.16b, #1
+	pmull2		t7.8h, t5.16b, REDUCE_LAST.16b
+	eor		t6.16b, t6.16b, t5.16b
+	eor		XH.16b, XH.16b, t6.16b
+	eor		XL.16b, XH.16b, t7.16b
 	.endm
 
 	/*
@@ -187,6 +185,9 @@ SYM_FUNC_START(pmull_ghash_update_p8)
 	ld1		{XL.2d}, [x1]
 
 	__pmull_pre_p8
+	movi		REDUCE_CONST.16b, #0xc2
+	movi		REDUCE_LAST.16b, #0
+	mov		REDUCE_LAST.b[15], REDUCE_CONST.b[0]
 
 0:	ld1		{T1.2d}, [x2], #16
 	sub		x0, x0, #1
@@ -204,14 +205,7 @@ SYM_FUNC_START(pmull_ghash_update_p8)
 	__pmull_p8 	XL, XL, SHASH			// a0 * b0
 	__pmull_p8	XM, T1, SHASH2			// (a1 + a0)(b1 + b0)
 
-	eor		T2.16b, XL.16b, XH.16b
-	ext		T1.16b, XL.16b, XH.16b, #8
-	eor		XM.16b, XM.16b, T2.16b
-
 	__pmull_reduce_p8
-
-	eor		T2.16b, T2.16b, XH.16b
-	eor		XL.16b, XL.16b, T2.16b
 
 	cbnz		x0, 0b
 
