@@ -218,3 +218,210 @@ SYM_FUNC_START(pmull_ghash_update_p8)
 	st1		{XL.2d}, [x1]
 	ret
 SYM_FUNC_END(pmull_ghash_update_p8)
+
+	.text
+
+	/* Prepare the next key operand while retiring the current products. */
+	.macro		__pmull_p8_4x_products, ad, p0, p1, p2, add=0, \
+			lo=x6, hi=x7, cross=0, lo2=x4, hi2=x5
+	tbl		v18.16b, {\ad\().16b}, v25.16b
+	.if		\cross
+	eor		x16, \lo, \lo, lsr #32
+	.endif
+	pmull		v19.8h, \ad\().8b, v9.8b
+	.if		\cross
+	eor		x17, \hi, \hi, lsr #32
+	.endif
+	pmull2		v20.8h, \ad\().16b, v9.16b
+	pmull		v21.8h, \ad\().8b, v10.8b
+	pmull2		v22.8h, \ad\().16b, v10.16b
+	.if		\add
+	eor		v19.16b, v19.16b, v20.16b
+	eor		\p0\().16b, \p0\().16b, v19.16b
+	.else
+	eor		\p0\().16b, v19.16b, v20.16b
+	.endif
+	pmull		v19.8h, v18.8b, v9.8b
+	pmull2		v20.8h, v18.16b, v9.16b
+	.if		\cross
+	fmov		s9, w16
+	eor		x16, \lo2, \lo2, lsr #32
+	.else
+	fmov		d9, \lo
+	.endif
+	eor		v21.16b, v21.16b, v22.16b
+	.if		\cross
+	mov		v9.s[1], w17
+	eor		x17, \hi2, \hi2, lsr #32
+	mov		v9.s[2], w16
+	.else
+	mov		v9.d[1], \hi
+	.endif
+	pmull		v22.8h, \ad\().8b, v11.8b
+	.if		\cross
+	mov		v9.s[3], w17
+	.else
+	tbl		v10.16b, {v9.16b}, v25.16b
+	.endif
+	pmull2		v23.8h, \ad\().16b, v11.16b
+	.if		\cross
+	tbl		v10.16b, {v9.16b}, v25.16b
+	.endif
+	rev32		v11.8h, v9.8h
+	eor		v19.16b, v19.16b, v20.16b
+	.if		\add
+	eor		v21.16b, v21.16b, v19.16b
+	eor		\p1\().16b, \p1\().16b, v21.16b
+	eor		v22.16b, v22.16b, v23.16b
+	eor		\p2\().16b, \p2\().16b, v22.16b
+	.else
+	eor		\p1\().16b, v21.16b, v19.16b
+	eor		\p2\().16b, v22.16b, v23.16b
+	.endif
+	.endm
+
+	.macro		__pmull_p8_4x_reconstruct, rq
+	tbl		v18.16b, {v13.16b}, v26.16b
+	tbl		v19.16b, {v16.16b}, v26.16b
+	tbl		v20.16b, {v13.16b}, v27.16b
+	tbl		v21.16b, {v16.16b}, v27.16b
+	eor		v12.16b, v12.16b, v18.16b
+	eor		v15.16b, v15.16b, v19.16b
+	rev64		v18.4s, v14.4s
+	rev64		v19.4s, v17.4s
+	eor		v12.16b, v12.16b, v20.16b
+	eor		v15.16b, v15.16b, v21.16b
+	eor		v14.16b, v14.16b, v18.16b
+	eor		v17.16b, v17.16b, v19.16b
+	tbl		v14.16b, {v14.16b}, v30.16b
+	tbl		v17.16b, {v17.16b}, v30.16b
+	eor		v12.16b, v12.16b, v14.16b
+	eor		v15.16b, v15.16b, v17.16b
+	eor		v18.16b, v12.16b, v15.16b
+	ext		v19.16b, v18.16b, v18.16b, #8
+	eor		v18.16b, v18.16b, v19.16b
+	tbl		v18.16b, {v18.16b}, v28.16b
+	eor		\rq\().16b, v12.16b, v18.16b
+	.endm
+
+	.macro		__pmull_p8_4x_cross, a, b, out
+	rev64		v18.4s, \a\().4s
+	rev64		v19.4s, \b\().4s
+	eor		v18.16b, v18.16b, \a\().16b
+	eor		v19.16b, v19.16b, \b\().16b
+	uzp1		\out\().4s, v18.4s, v19.4s
+	.endm
+
+	.macro		__pmull_p8_4x_input
+	ld1		{v18.16b-v21.16b}, [x2], #64
+	rev64		v18.16b, v18.16b
+	rev64		v19.16b, v19.16b
+	rev64		v20.16b, v20.16b
+	rev64		v21.16b, v21.16b
+	ext		v31.16b, v31.16b, v31.16b, #8
+	eor		v18.16b, v18.16b, v31.16b
+	zip2		v0.2d, v18.2d, v19.2d
+	zip1		v1.2d, v18.2d, v19.2d
+	zip2		v2.2d, v20.2d, v21.2d
+	zip1		v3.2d, v20.2d, v21.2d
+	eor		v4.16b, v0.16b, v1.16b
+	eor		v5.16b, v2.16b, v3.16b
+	.endm
+
+	.macro		__pmull_p8_4x_reduce
+	eor		v18.16b, v6.16b, v7.16b
+	ext		v19.16b, v6.16b, v7.16b, #8
+	eor		v8.16b, v8.16b, v18.16b
+	eor		v8.16b, v8.16b, v19.16b
+	zip1		v6.2d, v6.2d, v8.2d
+	zip2		v7.2d, v8.2d, v7.2d
+	pmull		v18.8h, v6.8b, v29.8b
+	pmull2		v19.8h, v6.16b, v29.16b
+	eor		v7.16b, v7.16b, v6.16b
+	uzp1		v20.16b, v18.16b, v19.16b
+	uzp2		v21.16b, v18.16b, v19.16b
+	ext		v20.16b, v20.16b, v20.16b, #1
+	shl		v23.2d, v29.2d, #56
+	pmull2		v22.8h, v20.16b, v23.16b
+	eor		v21.16b, v21.16b, v20.16b
+	eor		v7.16b, v7.16b, v21.16b
+	eor		v31.16b, v7.16b, v22.16b
+	.endm
+
+	/*
+	 * x0: block count, x1: POLYVAL accumulator, x2: GHASH input,
+	 * x3: struct ghash_key (H, H^2, H^3, H^4 in POLYVAL format).
+	 *
+	 * x4-x7 retain the low halves of H^4 through H, x8-x11 their high
+	 * halves, and x12-x15 their XORs.  x16-x17 construct the inner
+	 * Karatsuba cross operands.  No stack or callee-saved GPR is used.
+	 */
+SYM_FUNC_START(pmull_ghash_update_p8_4x)
+	cbz		x0, .Lfour_exit
+	cmp		x0, #4
+	b.lo		pmull_ghash_update_p8
+	adr_l		x4, .Lpmull_p8_4x_masks
+	ld1		{v25.16b-v28.16b}, [x4], #64
+	ld1		{v30.16b}, [x4]
+	add		x4, x3, #32
+	ld1		{v0.16b-v1.16b}, [x4]
+	ld1		{v2.16b-v3.16b}, [x3]
+	zip1		v4.2d, v1.2d, v0.2d
+	zip2		v5.2d, v1.2d, v0.2d
+	zip1		v6.2d, v3.2d, v2.2d
+	zip2		v7.2d, v3.2d, v2.2d
+	eor		v8.16b, v4.16b, v5.16b
+	eor		v9.16b, v6.16b, v7.16b
+	umov		x4, v4.d[0]
+	umov		x5, v4.d[1]
+	umov		x6, v6.d[0]
+	umov		x7, v6.d[1]
+	umov		x8, v5.d[0]
+	umov		x9, v5.d[1]
+	umov		x10, v7.d[0]
+	umov		x11, v7.d[1]
+	umov		x12, v8.d[0]
+	umov		x13, v8.d[1]
+	umov		x14, v9.d[0]
+	umov		x15, v9.d[1]
+	ld1		{v31.16b}, [x1]
+	movi		v29.16b, #0xc2
+	fmov		d9, x4
+	mov		v9.d[1], x5
+	tbl		v10.16b, {v9.16b}, v25.16b
+	rev32		v11.8h, v9.8h
+.Lfour_loop:
+	__pmull_p8_4x_input
+	__pmull_p8_4x_cross v0, v2, v31
+	__pmull_p8_4x_products v0, v12, v13, v14, 0, x6, x7
+	__pmull_p8_4x_products v2, v12, v13, v14, 1, x4, x5, 1, x6, x7
+	__pmull_p8_4x_products v31, v15, v16, v17, 0, x8, x9
+	__pmull_p8_4x_reconstruct v6
+	__pmull_p8_4x_cross v1, v3, v24
+	__pmull_p8_4x_products v1, v12, v13, v14, 0, x10, x11
+	__pmull_p8_4x_products v3, v12, v13, v14, 1, x8, x9, 1, x10, x11
+	__pmull_p8_4x_products v24, v15, v16, v17, 0, x12, x13
+	__pmull_p8_4x_reconstruct v7
+	eor		v24.16b, v24.16b, v31.16b
+	__pmull_p8_4x_products v4, v12, v13, v14, 0, x14, x15
+	__pmull_p8_4x_products v5, v12, v13, v14, 1, x12, x13, 1, x14, x15
+	__pmull_p8_4x_products v24, v15, v16, v17, 0, x4, x5
+	__pmull_p8_4x_reconstruct v8
+	__pmull_p8_4x_reduce
+	sub		x0, x0, #4
+	cmp		x0, #4
+	b.hs		.Lfour_loop
+	st1		{v31.16b}, [x1]
+	cbnz		x0, pmull_ghash_update_p8
+.Lfour_exit:
+	ret
+SYM_FUNC_END(pmull_ghash_update_p8_4x)
+
+	.section	.rodata, "a"
+	.align		4
+.Lpmull_p8_4x_masks:
+	.byte		1, 2, 3, 0, 5, 6, 7, 4, 9, 10, 11, 8, 13, 14, 15, 12
+	.byte		255, 0, 1, 2, 3, 4, 5, 255, 255, 8, 9, 10, 11, 12, 13, 255
+	.byte		255, 255, 255, 6, 7, 255, 255, 255, 255, 255, 255, 14, 15, 255, 255, 255
+	.byte		255, 255, 255, 255, 0, 1, 2, 3, 4, 5, 6, 7, 255, 255, 255, 255
+	.byte		255, 255, 0, 1, 2, 3, 255, 255, 255, 255, 8, 9, 10, 11, 255, 255

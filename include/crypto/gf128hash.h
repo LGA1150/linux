@@ -50,6 +50,10 @@ struct ghash_key {
 #endif
 	/** @h: The hash key H, in POLYVAL format */
 	struct polyval_elem h;
+#if defined(CONFIG_CRYPTO_LIB_GF128HASH_ARCH) && defined(CONFIG_ARM64)
+	/** @h_powers: GHASH powers H^2 through H^4, in POLYVAL format */
+	struct polyval_elem h_powers[3];
+#endif
 };
 
 /**

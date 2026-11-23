@@ -15,11 +15,31 @@ static __ro_after_init DEFINE_STATIC_KEY_FALSE(have_pmull);
 asmlinkage void pmull_ghash_update_p8(size_t blocks, struct polyval_elem *dg,
 				      const u8 *src,
 				      const struct polyval_elem *h);
+asmlinkage void pmull_ghash_update_p8_4x(size_t blocks, struct polyval_elem *dg,
+					 const u8 *src,
+					 const struct ghash_key *key);
 asmlinkage void polyval_mul_pmull(struct polyval_elem *a,
 				  const struct polyval_elem *b);
 asmlinkage void polyval_blocks_pmull(struct polyval_elem *acc,
 				     const struct polyval_key *key,
 				     const u8 *data, size_t nblocks);
+
+#define ghash_preparekey_arch ghash_preparekey_arch
+static void ghash_preparekey_arch(struct ghash_key *key,
+				  const u8 raw_key[GHASH_BLOCK_SIZE])
+{
+	const struct polyval_elem *prev = &key->h;
+
+	static_assert(offsetof(struct ghash_key, h) == 0);
+	static_assert(offsetof(struct ghash_key, h_powers) == GHASH_BLOCK_SIZE);
+	static_assert(sizeof(*key) == 4 * GHASH_BLOCK_SIZE);
+	ghash_key_to_polyval(raw_key, &key->h);
+	for (int i = 0; i < ARRAY_SIZE(key->h_powers); i++) {
+		key->h_powers[i] = *prev;
+		polyval_mul_generic(&key->h_powers[i], &key->h);
+		prev = &key->h_powers[i];
+	}
+}
 
 #define polyval_preparekey_arch polyval_preparekey_arch
 static void polyval_preparekey_arch(struct polyval_key *key,
@@ -90,7 +110,7 @@ static void ghash_blocks_arch(struct polyval_elem *acc,
 {
 	if (static_branch_likely(&have_asimd) && may_use_simd()) {
 		scoped_ksimd()
-			pmull_ghash_update_p8(nblocks, acc, data, &key->h);
+			pmull_ghash_update_p8_4x(nblocks, acc, data, key);
 	} else {
 		ghash_blocks_generic(acc, &key->h, data, nblocks);
 	}
