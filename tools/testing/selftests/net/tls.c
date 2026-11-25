@@ -3009,6 +3009,98 @@ static void tls_send_bad_auth(struct __test_metadata *_metadata,
 	tls_send_record(_metadata, fd, cfd, fd2, txt, sizeof(txt), true);
 }
 
+static void tls_relay_queued_records(struct __test_metadata *_metadata,
+				     int fd, int cfd, int fd2, int cfd2,
+				     unsigned int chunk, bool drain)
+{
+	static const unsigned int lengths[] = {
+		63, 1, 16384, 4097, 127, 16383, 32, 8192, 1023, 64,
+	};
+	char sent[65536], received[sizeof(sent)], wire[sizeof(sent) + 640];
+	unsigned int i, plain_len = 0, wire_len = 0, off, len;
+	int p[2], one = 1;
+	ssize_t ret;
+
+	memrnd(sent, sizeof(sent));
+	for (i = 0; i < ARRAY_SIZE(lengths); i++) {
+		ASSERT_EQ(send(fd, sent + plain_len, lengths[i], 0), lengths[i]);
+		ASSERT_EQ(recv(cfd, wire + wire_len, TLS_HDR_LEN, MSG_WAITALL),
+			  TLS_HDR_LEN);
+		len = ((unsigned char)wire[wire_len + 3] << 8) |
+		      (unsigned char)wire[wire_len + 4];
+		ASSERT_GT(len, 0);
+		ASSERT_LE(wire_len + TLS_HDR_LEN + len, sizeof(wire));
+		ASSERT_EQ(recv(cfd, wire + wire_len + TLS_HDR_LEN, len,
+			       MSG_WAITALL), len);
+		wire_len += TLS_HDR_LEN + len;
+		plain_len += lengths[i];
+	}
+
+	ASSERT_EQ(setsockopt(fd2, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)), 0);
+	if (!chunk)
+		chunk = wire_len;
+	/* Relay independently of TLS record boundaries, allowing records to
+	 * share a TCP skb or span multiple skbs and page fragments.
+	 */
+	for (off = 0; off < wire_len; off += ret) {
+		len = wire_len - off;
+		if (len > chunk)
+			len = chunk;
+		ret = send(fd2, wire + off, len, 0);
+		ASSERT_GT(ret, 0);
+	}
+	ASSERT_EQ(shutdown(fd2, SHUT_WR), 0);
+
+	ASSERT_EQ(pipe(p), 0);
+	/* Start the splice pipeline, leaving a partial plaintext record and
+	 * queued records whose input must survive TCP consumption.
+	 */
+	ASSERT_EQ(splice(cfd2, NULL, p[1], NULL, 1, 0), 1);
+	ASSERT_EQ(read(p[0], received, 1), 1);
+	ASSERT_EQ(recv(cfd2, received + 1, 31, MSG_PEEK | MSG_WAITALL), 31);
+	EXPECT_EQ(memcmp(sent, received, 32), 0);
+	if (drain) {
+		ASSERT_EQ(recv(cfd2, received + 1, 31, MSG_WAITALL), 31);
+		for (off = 32; off < plain_len; off += ret) {
+			ret = splice(cfd2, NULL, p[1], NULL, plain_len - off, 0);
+			ASSERT_GT(ret, 0);
+			ASSERT_EQ(read(p[0], received + off, ret), ret);
+		}
+		EXPECT_EQ(memcmp(sent, received, plain_len), 0);
+		EXPECT_EQ(recv(cfd2, received, 1, 0), 0);
+	}
+	/* The close case leaves the remaining records for socket teardown. */
+	close(p[0]);
+	close(p[1]);
+}
+
+TEST_F(tls_err, splice_recv_shared_records)
+{
+	if (self->notls)
+		SKIP(return, "no TLS support");
+
+	tls_relay_queued_records(_metadata, self->fd, self->cfd, self->fd2,
+				 self->cfd2, 0, true);
+}
+
+TEST_F(tls_err, splice_recv_fragmented_records)
+{
+	if (self->notls)
+		SKIP(return, "no TLS support");
+
+	tls_relay_queued_records(_metadata, self->fd, self->cfd, self->fd2,
+				 self->cfd2, 1440, true);
+}
+
+TEST_F(tls_err, splice_recv_queued_close)
+{
+	if (self->notls)
+		SKIP(return, "no TLS support");
+
+	tls_relay_queued_records(_metadata, self->fd, self->cfd, self->fd2,
+				 self->cfd2, 1440, false);
+}
+
 TEST_F(tls_err, bad_auth)
 {
 	char buf[128];

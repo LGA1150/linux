@@ -1982,7 +1982,7 @@ static int tls_rx_batch_collect(struct tls_sw_context_rx *ctx)
 			err = -ENOMEM;
 			break;
 		}
-		rec->skb = tls_strp_msg_detach(ctx);
+		rec->skb = tls_strp_msg_clone(ctx);
 		if (!rec->skb) {
 			kfree(rec);
 			err = -ENOMEM;
