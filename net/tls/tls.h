@@ -202,6 +202,7 @@ void tls_rx_msg_maybe_announce(struct tls_strparser *strp);
 bool tls_strp_msg_load(struct tls_strparser *strp, bool force_refresh);
 int tls_strp_msg_cow(struct tls_sw_context_rx *ctx);
 struct sk_buff *tls_strp_msg_detach(struct tls_sw_context_rx *ctx);
+struct sk_buff *tls_strp_msg_clone(struct tls_sw_context_rx *ctx);
 int tls_strp_msg_hold(struct tls_strparser *strp, struct sk_buff_head *dst);
 
 static inline struct tls_msg *tls_msg(struct sk_buff *skb)

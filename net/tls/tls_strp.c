@@ -104,6 +104,57 @@ struct sk_buff *tls_strp_msg_detach(struct tls_sw_context_rx *ctx)
 	return tls_strp_msg_make_copy(strp);
 }
 
+/* Retain read-only input after consuming the TCP queue. The anchor borrows
+ * that queue's links, so each record needs its own chain of skb clones.
+ */
+struct sk_buff *tls_strp_msg_clone(struct tls_sw_context_rx *ctx)
+{
+	struct tls_strparser *strp = &ctx->strp;
+	struct sk_buff *skb, *iter, *clone, **next;
+	int offset = strp->stm.offset;
+	int len = strp->stm.full_len;
+
+	if (strp->copy_mode)
+		return tls_strp_msg_detach(ctx);
+
+	skb = alloc_skb(0, strp->sk->sk_allocation);
+	if (!skb)
+		return NULL;
+
+	skb_copy_header(skb, strp->anchor);
+	next = &skb_shinfo(skb)->frag_list;
+	iter = skb_shinfo(strp->anchor)->frag_list;
+	for (; len > 0; iter = iter->next) {
+		if (iter->len <= offset) {
+			offset -= iter->len;
+			continue;
+		}
+
+		clone = skb_clone(iter, strp->sk->sk_allocation);
+		if (!clone)
+			goto err_free;
+
+		if (!skb->len)
+			strp_msg(skb)->offset = offset;
+		*next = clone;
+		next = &clone->next;
+		skb->len += clone->len;
+		skb->data_len += clone->len;
+		skb->truesize += clone->truesize;
+		len -= clone->len - offset;
+		offset = 0;
+	}
+
+	/* Keep whole skbs shared. The record offset and length delimit input,
+	 * including when several records occupy the same TCP skb.
+	 */
+	return skb;
+
+err_free:
+	kfree_skb(skb);
+	return NULL;
+}
+
 /* Force the input skb to be in copy mode. The data ownership remains
  * with the input skb itself (meaning unpause will wipe it) but it can
  * be modified.
