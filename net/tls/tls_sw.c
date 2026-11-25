@@ -36,6 +36,7 @@
  */
 
 #include <linux/bug.h>
+#include <linux/dma-mapping.h>
 #include <linux/sched/signal.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -50,6 +51,10 @@
 
 /* Bound speculative ciphertext and plaintext retained by a reader. */
 #define TLS_RX_BATCH_RECORDS	8
+
+static bool rx_inplace = true;
+module_param(rx_inplace, bool, 0644);
+MODULE_PARM_DESC(rx_inplace, "Decrypt buffered async RX records in private aligned buffers");
 
 struct tls_rx_record {
 	struct list_head list;
@@ -1292,17 +1297,19 @@ out:
 
 static struct sk_buff *
 tls_alloc_clrtxt_skb(struct sock *sk, struct sk_buff *skb,
-		     unsigned int full_len)
+		     unsigned int full_len, unsigned int headroom)
 {
 	struct strp_msg *clr_rxm;
 	struct sk_buff *clr_skb;
 	int err;
 
-	clr_skb = alloc_skb_with_frags(0, full_len, TLS_PAGE_ORDER,
+	clr_skb = alloc_skb_with_frags(0, full_len + headroom, TLS_PAGE_ORDER,
 				       &err, sk->sk_allocation);
 	if (!clr_skb)
 		return NULL;
 
+	skb_frag_off_add(&skb_shinfo(clr_skb)->frags[0], headroom);
+	skb_frag_size_sub(&skb_shinfo(clr_skb)->frags[0], headroom);
 	skb_copy_header(clr_skb, skb);
 	clr_skb->len = full_len;
 	clr_skb->data_len = full_len;
@@ -1311,6 +1318,23 @@ tls_alloc_clrtxt_skb(struct sock *sk, struct sk_buff *skb,
 	clr_rxm->offset = 0;
 
 	return clr_skb;
+}
+
+static int tls_copy_ciphertext(struct sk_buff *dst, struct sk_buff *src)
+{
+	int offset = strp_msg(src)->offset;
+	int i, err;
+
+	for (i = 0; i < skb_shinfo(dst)->nr_frags; i++) {
+		skb_frag_t *frag = &skb_shinfo(dst)->frags[i];
+
+		err = skb_copy_bits(src, offset, skb_frag_address(frag),
+				    skb_frag_size(frag));
+		if (err)
+			return err;
+		offset += skb_frag_size(frag);
+	}
+	return 0;
 }
 
 /* Decrypt handlers
@@ -1353,12 +1377,8 @@ static int tls_decrypt_sg(struct sock *sk, struct iov_iter *out_iov,
 	struct sk_buff *clear_skb;
 	char *rec_seq = darg->rec ? darg->rec->rec_seq : tls_ctx->rx.rec_seq;
 	int iv_offset = 0;
+	bool inplace = false;
 	u8 *mem;
-
-	n_sgin = skb_nsg(skb, rxm->offset + prot->prepend_size,
-			 rxm->full_len - prot->prepend_size);
-	if (n_sgin < 1)
-		return n_sgin ?: -EBADMSG;
 
 	if (darg->zc && (out_iov || out_sg)) {
 		clear_skb = NULL;
@@ -1369,13 +1389,38 @@ static int tls_decrypt_sg(struct sock *sk, struct iov_iter *out_iov,
 		else
 			n_sgout = sg_nents(out_sg);
 	} else {
-		darg->zc = false;
+		unsigned int headroom = 0;
 
-		clear_skb = tls_alloc_clrtxt_skb(sk, skb, rxm->full_len);
+		darg->zc = false;
+		inplace = ctx->async_capable && READ_ONCE(rx_inplace);
+		/* Align the payload, leaving the record header immediately before
+		 * it. Subsequent fragments start at page boundaries.
+		 */
+		if (inplace)
+			headroom = ALIGN(prot->prepend_size,
+					 dma_get_cache_alignment()) - prot->prepend_size;
+
+		clear_skb = tls_alloc_clrtxt_skb(sk, skb, rxm->full_len, headroom);
 		if (!clear_skb)
 			return -ENOMEM;
 
-		n_sgout = 1 + skb_shinfo(clear_skb)->nr_frags;
+		if (inplace) {
+			/* Keep the original ciphertext for retries after KeyUpdate.
+			 * Only these private pages may be overwritten by the AEAD.
+			 */
+			err = tls_copy_ciphertext(clear_skb, skb);
+			if (err)
+				goto exit_free_skb;
+		}
+		n_sgout = inplace ? 0 : 1 + skb_shinfo(clear_skb)->nr_frags;
+	}
+
+	n_sgin = inplace ? skb_shinfo(clear_skb)->nr_frags :
+		skb_nsg(skb, rxm->offset + prot->prepend_size,
+			rxm->full_len - prot->prepend_size);
+	if (n_sgin < 1) {
+		err = n_sgin ?: -EBADMSG;
+		goto exit_free_skb;
 	}
 
 	/* Increment to accommodate AAD */
@@ -1403,7 +1448,7 @@ static int tls_decrypt_sg(struct sock *sk, struct iov_iter *out_iov,
 	dctx->offset = darg->offset;
 	dctx->copy_bytes = darg->copy_bytes;
 	sgin = &dctx->sg[0];
-	sgout = &dctx->sg[n_sgin];
+	sgout = inplace ? sgin : &dctx->sg[n_sgin];
 
 	/* For CCM based ciphers, first byte of nonce+iv is a constant */
 	switch (prot->cipher_type) {
@@ -1439,13 +1484,13 @@ static int tls_decrypt_sg(struct sock *sk, struct iov_iter *out_iov,
 	/* Prepare sgin */
 	sg_init_table(sgin, n_sgin);
 	sg_set_buf(&sgin[0], dctx->aad, prot->aad_size);
-	err = skb_to_sgvec(skb, &sgin[1],
-			   rxm->offset + prot->prepend_size,
+	err = skb_to_sgvec(inplace ? clear_skb : skb, &sgin[1],
+			   (inplace ? 0 : rxm->offset) + prot->prepend_size,
 			   rxm->full_len - prot->prepend_size);
 	if (err < 0)
 		goto exit_free;
 
-	if (clear_skb) {
+	if (clear_skb && !inplace) {
 		sg_init_table(sgout, n_sgout);
 		sg_set_buf(&sgout[0], dctx->aad, prot->aad_size);
 
@@ -1453,7 +1498,7 @@ static int tls_decrypt_sg(struct sock *sk, struct iov_iter *out_iov,
 				   data_len + prot->tail_size);
 		if (err < 0)
 			goto exit_free;
-	} else if (out_iov) {
+	} else if (!clear_skb && out_iov) {
 		sg_init_table(sgout, n_sgout);
 		sg_set_buf(&sgout[0], dctx->aad, prot->aad_size);
 
@@ -1468,7 +1513,7 @@ static int tls_decrypt_sg(struct sock *sk, struct iov_iter *out_iov,
 				   prot->tail_size);
 			sg_mark_end(&sgout[pages + 1]);
 		}
-	} else if (out_sg) {
+	} else if (!clear_skb && out_sg) {
 		memcpy(sgout, out_sg, n_sgout * sizeof(*sgout));
 	}
 	dctx->free_sgout = !!pages;
