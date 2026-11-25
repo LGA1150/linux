@@ -918,6 +918,49 @@ TEST_F(tls, splice_recv_pipeline)
 	close(p[1]);
 }
 
+TEST_F(tls, buffered_recv_boundaries)
+{
+	static const unsigned int lengths[] = {
+		1, 15, 16, 17, 63, 64, 65, 127, 128, 129,
+		3967, 3968, 3969, 4095, 4096, 4097,
+		16319, 16320, 16321, 16383, 16384,
+	};
+	char sent[4][TLS_PAYLOAD_MAX_LEN], received[TLS_PAYLOAD_MAX_LEN];
+	unsigned int l, record, len, off;
+	int p[2];
+	ssize_t ret;
+
+	memrnd(sent, sizeof(sent));
+	ASSERT_EQ(pipe(p), 0);
+	for (l = 0; l < ARRAY_SIZE(lengths); l++) {
+		len = lengths[l];
+		for (record = 0; record < ARRAY_SIZE(sent); record++)
+			ASSERT_EQ(send(self->fd, sent[record], len, 0), len);
+
+		for (record = 0; record < ARRAY_SIZE(sent); record++) {
+			/* Buffer each record, then switch from splice to peek/recv
+			 * across cipher, cache-line and page boundaries.
+			 */
+			ret = splice(self->cfd, NULL, p[1], NULL, (len + 1) / 2, 0);
+			ASSERT_GT(ret, 0);
+			ASSERT_EQ(read(p[0], received, ret), ret);
+			off = ret;
+			if (off < len) {
+				ASSERT_EQ(recv(self->cfd, received + off, len - off,
+					       MSG_PEEK | MSG_WAITALL), len - off);
+				EXPECT_EQ(memcmp(received, sent[record], len), 0);
+				ASSERT_EQ(recv(self->cfd, received + off, len - off,
+					       MSG_WAITALL), len - off);
+			}
+			EXPECT_EQ(memcmp(received, sent[record], len), 0);
+		}
+	}
+	EXPECT_EQ(recv(self->cfd, received, 1, MSG_DONTWAIT), -1);
+	EXPECT_EQ(errno, EAGAIN);
+	close(p[0]);
+	close(p[1]);
+}
+
 TEST_F(tls, send_and_splice)
 {
 	int send_len = TLS_PAYLOAD_MAX_LEN;
